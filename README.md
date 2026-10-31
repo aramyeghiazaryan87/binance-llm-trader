@@ -244,10 +244,12 @@ git pull && docker compose up -d --build
 Только для теста и только в режиме `paper`. Binance отвечает `451 restricted location` на IP облачных серверов Claude, **в том числе testnet**, поэтому ордера на testnet оттуда не проходят. Для теста логики, Claude, новостей и Telegram на реальных ценах:
 
 1. В настройках среды (Network access → Allowed domains) добавьте `data-api.binance.vision`. Это официальный эндпоинт Binance только для публичных рыночных данных.
-2. В новой сессии выполните:
+2. Ключ Claude задайте в переменных среды как `ANTHROPIC_API_KEY` или `TRADER_ANTHROPIC_API_KEY` (второе имя удобно, если первое занято самой средой).
+3. В новой сессии выполните:
    ```bash
-   TRADING_MODE=paper MARKET_DATA_URL=https://data-api.binance.vision python -m trader once
+   TRADING_MODE=paper HTTP_TRUST_ENV=1 MARKET_DATA_URL=https://data-api.binance.vision python -m trader once
    ```
+   `HTTP_TRUST_ENV=1` нужен потому, что облако пропускает трафик через прокси со своим сертификатом, а ccxt по умолчанию не читает прокси и CA из окружения (без флага будет `CERTIFICATE_VERIFY_FAILED`).
 
 Настоящую торговлю на testnet запускайте на своём компьютере или на VPS в стране, где Binance работает.
 
@@ -258,7 +260,8 @@ git pull && docker compose up -d --build
 | `451` / `restricted location` | Binance недоступен из страны сервера (так же и из облака Claude): запускайте на компьютере или VPS в другой стране |
 | `Timestamp for this request is outside of the recvWindow` | Отстают часы сервера: `sudo timedatectl set-ntp true` |
 | `Invalid API-key, IP, or permissions` | Ключ не от того режима (testnet ≠ live), нет права Spot Trading или IP не в белом списке |
-| `LLM: disabled` | Не задан `ANTHROPIC_API_KEY` или `LLM_ENABLED=false` |
+| `LLM: disabled` | Не задан `ANTHROPIC_API_KEY` (или `TRADER_ANTHROPIC_API_KEY`), либо `LLM_ENABLED=false` |
+| `CERTIFICATE_VERIFY_FAILED` / `self-signed certificate` | Трафик идёт через прокси со своим сертификатом (корпоративная сеть, облако Claude): задайте `HTTP_TRUST_ENV=1` и `REQUESTS_CA_BUNDLE=<путь к CA>` |
 | `LLM: skipped … бюджет` | Месячный лимит или экономия по графику; в новом месяце вызовы возобновятся |
 | Сигналов нет часами | Это нормально: стратегия ждёт пробоя в восходящем тренде. В падающем рынке входов не будет |
 | После сброса testnet позиции «закрыты в учёте» | Монеты исчезли со счёта, бот провёл сверку. Сделайте `reset --yes` |

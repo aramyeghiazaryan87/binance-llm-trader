@@ -11,9 +11,10 @@ Binance spot бот: стратегия трендового пробоя (`trad
 ## Облачная сессия Claude Code
 - Binance отвечает `451 restricted location` на IP облака Claude, **включая testnet**. Ордера на testnet отсюда невозможны, обходить блокировку (VPN/прокси) нельзя.
 - Здесь доступен только paper-режим на публичных данных:
-  `TRADING_MODE=paper MARKET_DATA_URL=https://data-api.binance.vision python -m trader once`
+  `TRADING_MODE=paper HTTP_TRUST_ENV=1 MARKET_DATA_URL=https://data-api.binance.vision python -m trader once`
+  (`HTTP_TRUST_ENV=1`: ccxt читает прокси и CA среды, иначе `CERTIFICATE_VERIFY_FAILED`; проверку TLS не отключать).
   (домен `data-api.binance.vision` должен быть в Allowed domains среды; если он тоже отвечает 451, тестировать можно только офлайн).
-- Ключи (`BINANCE_TESTNET_API_KEY`, `BINANCE_TESTNET_API_SECRET`, `ANTHROPIC_API_KEY`, `TELEGRAM_*`) задаются переменными окружения среды; не просить их в чате и не выводить в лог.
+- Ключи (`BINANCE_TESTNET_API_KEY`, `BINANCE_TESTNET_API_SECRET`, `ANTHROPIC_API_KEY` или `TRADER_ANTHROPIC_API_KEY`, `TELEGRAM_*`) задаются переменными окружения среды; не просить их в чате и не выводить в лог.
 - Постоянная работа бота: компьютер пользователя или VPS в разрешённой стране (не США).
 
 ## Правила проекта

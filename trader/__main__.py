@@ -71,7 +71,7 @@ def cmd_check(engine) -> int:
 
     print("\n[5] Claude API")
     if engine.advisor is None:
-        print("  LLM выключен или не задан ANTHROPIC_API_KEY " f"(при сбое LLM действует режим {s.llm_fail_mode})")
+        print("  LLM выключен или не задан ANTHROPIC_API_KEY (TRADER_ANTHROPIC_API_KEY) " f"(при сбое LLM действует режим {s.llm_fail_mode})")
     else:
         now = engine.clock()
         account = engine.account_state({}) if engine.storage.get("starting_capital") else None

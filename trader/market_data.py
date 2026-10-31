@@ -31,11 +31,14 @@ def make_binance(
     sandbox: bool = False,
     demo: bool = False,
     public_url: str = "",
+    trust_env: bool = False,
 ) -> ccxt.binance:
     """Создаёт клиент ccxt для спота Binance (без ключей — только публичные данные).
 
     public_url — другой адрес для публичных данных, например https://data-api.binance.vision
     (официальный эндпоинт Binance только для рыночных данных).
+    trust_env — читать прокси и CA-сертификаты из окружения (HTTPS_PROXY, REQUESTS_CA_BUNDLE).
+    По умолчанию ccxt их игнорирует; нужно, например, за корпоративным прокси или в облаке Claude.
     """
     exchange = ccxt.binance(
         {
@@ -43,6 +46,9 @@ def make_binance(
             "secret": secret or None,
             "enableRateLimit": True,
             "timeout": 20_000,
+            # ccxt создаёт сессию requests в конструкторе, поэтому флаг передаём здесь
+            "requests_trust_env": trust_env,
+            "aiohttp_trust_env": trust_env,
             "options": {
                 "defaultType": "spot",
                 "fetchMarkets": {"types": ["spot"]},

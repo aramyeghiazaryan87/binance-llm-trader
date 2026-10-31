@@ -150,3 +150,47 @@ def test_public_market_data_url_override():
     assert data.urls["api"]["public"] == "https://data-api.binance.vision/api/v3"
     assert data.urls["api"]["private"] == "https://api.binance.com/api/v3"  # ордера не трогаем
     assert plain.urls["api"]["public"] == "https://api.binance.com/api/v3"  # другие клиенты не затронуты
+
+
+def test_make_binance_trust_env_flag():
+    from trader.market_data import make_binance
+
+    assert make_binance().session.trust_env is False  # по умолчанию ccxt игнорирует прокси/CA окружения
+    assert make_binance(trust_env=True).session.trust_env is True
+
+
+def _clear_env(monkeypatch):
+    for name in ("ANTHROPIC_API_KEY", "TRADER_ANTHROPIC_API_KEY", "HTTP_TRUST_ENV", "TRADING_MODE"):
+        monkeypatch.setenv(name, "")
+
+
+def test_anthropic_key_fallback_and_trust_env(monkeypatch, tmp_path):
+    from trader.config import Settings
+
+    _clear_env(monkeypatch)
+    monkeypatch.setenv("TRADING_MODE", "paper")
+    s = Settings.from_env(env_file=None)
+    assert s.anthropic_api_key == "" and s.http_trust_env is False
+
+    monkeypatch.setenv("TRADER_ANTHROPIC_API_KEY", "sk-trader")
+    monkeypatch.setenv("HTTP_TRUST_ENV", "1")
+    s = Settings.from_env(env_file=None)
+    assert s.anthropic_api_key == "sk-trader" and s.http_trust_env is True
+    assert "sk-trader" not in repr(s)  # ключ не попадает в логи
+
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-main")  # стандартное имя важнее
+    assert Settings.from_env(env_file=None).anthropic_api_key == "sk-main"
+
+
+def test_build_advisor_uses_settings_key(monkeypatch, settings):
+    from dataclasses import replace
+
+    from trader.app import build_advisor
+    from trader.storage import Storage
+
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("ANTHROPIC_AUTH_TOKEN", raising=False)
+    storage = Storage(settings.db_path)
+    assert build_advisor(settings, storage) is None
+    advisor = build_advisor(replace(settings, anthropic_api_key="sk-trader"), storage)
+    assert advisor is not None and advisor.client.api_key == "sk-trader"
