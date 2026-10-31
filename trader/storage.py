@@ -65,6 +65,24 @@ CREATE TABLE IF NOT EXISTS decisions (
     kind TEXT NOT NULL,
     payload TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS shadow_positions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    signal_id TEXT NOT NULL UNIQUE,
+    symbol TEXT NOT NULL,
+    source TEXT NOT NULL,
+    reason TEXT NOT NULL DEFAULT '',
+    confidence REAL,
+    entry_time TEXT NOT NULL,
+    entry_price REAL NOT NULL,
+    stop_price REAL NOT NULL,
+    highest_price REAL NOT NULL,
+    atr REAL NOT NULL,
+    status TEXT NOT NULL DEFAULT 'open',
+    exit_time TEXT,
+    exit_price REAL,
+    exit_reason TEXT,
+    pnl_pct REAL
+);
 CREATE TABLE IF NOT EXISTS equity (
     time TEXT NOT NULL,
     equity REAL NOT NULL,
@@ -120,6 +138,38 @@ class Position:
         data["exit_time"] = from_iso(data.get("exit_time"))
         names = {f.name for f in fields(cls)}
         return cls(**{k: v for k, v in data.items() if k in names})
+
+
+@dataclass
+class Shadow:
+    """Отклонённый сигнал: чем закончилась бы сделка, если бы бот вошёл. Ордеров нет.
+
+    source: llm — отклонил Claude; regime — фильтр рынка; hold — Claude недоступен или пропущен.
+    """
+
+    signal_id: str
+    symbol: str
+    source: str
+    entry_time: datetime
+    entry_price: float
+    stop_price: float
+    highest_price: float
+    atr: float
+    reason: str = ""
+    confidence: float | None = None
+    status: str = "open"
+    exit_time: datetime | None = None
+    exit_price: float | None = None
+    exit_reason: str | None = None
+    pnl_pct: float | None = None  # за вычетом комиссии и проскальзывания
+    id: int | None = None
+
+    @classmethod
+    def from_row(cls, row: sqlite3.Row) -> "Shadow":
+        data = dict(row)
+        data["entry_time"] = from_iso(data["entry_time"])
+        data["exit_time"] = from_iso(data.get("exit_time"))
+        return cls(**data)
 
 
 class Storage:
@@ -191,6 +241,46 @@ class Storage:
     def realized_pnl(self) -> float:
         row = self.conn.execute("SELECT COALESCE(SUM(pnl_usdt), 0) AS s FROM positions WHERE status = 'closed'").fetchone()
         return float(row["s"])
+
+    # ---------- тень: отклонённые сигналы ----------
+    def add_shadow(self, sh: Shadow) -> bool:
+        """False, если этот сигнал уже записан (повтор цикла в том же часе)."""
+        data = asdict(sh)
+        data.pop("id")
+        data["entry_time"] = to_iso(sh.entry_time)
+        data["exit_time"] = to_iso(sh.exit_time) if sh.exit_time else None
+        columns = ", ".join(data)
+        marks = ", ".join("?" for _ in data)
+        cur = self.conn.execute(
+            f"INSERT OR IGNORE INTO shadow_positions({columns}) VALUES({marks})", tuple(data.values())
+        )
+        self.conn.commit()
+        if cur.rowcount:
+            sh.id = cur.lastrowid
+        return bool(cur.rowcount)
+
+    def update_shadow(self, sh: Shadow) -> None:
+        if sh.id is None:
+            raise ValueError("тень без id")
+        data = asdict(sh)
+        sh_id = data.pop("id")
+        data["entry_time"] = to_iso(sh.entry_time)
+        data["exit_time"] = to_iso(sh.exit_time) if sh.exit_time else None
+        assignments = ", ".join(f"{k} = ?" for k in data)
+        self.conn.execute(f"UPDATE shadow_positions SET {assignments} WHERE id = ?", (*data.values(), sh_id))
+        self.conn.commit()
+
+    def shadows(self, *, status: str | None = None, since: datetime | None = None) -> list[Shadow]:
+        """status=open/closed; since — по времени входа (для открытых) или выхода (для закрытых)."""
+        query, args = "SELECT * FROM shadow_positions WHERE 1=1", []
+        if status:
+            query += " AND status = ?"
+            args.append(status)
+        if since is not None:
+            query += " AND COALESCE(exit_time, entry_time) >= ?" if status == "closed" else " AND entry_time >= ?"
+            args.append(to_iso(since))
+        rows = self.conn.execute(query + " ORDER BY id", args).fetchall()
+        return [Shadow.from_row(r) for r in rows]
 
     # ---------- сделки ----------
     def add_trade(

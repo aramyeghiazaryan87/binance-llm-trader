@@ -8,6 +8,7 @@
     python -m trader close-all          продать все позиции бота
     python -m trader reset-kill-switch  снять аварийную остановку
     python -m trader reset --yes        удалить базу состояния (только без открытых позиций)
+    python -m trader shadow             отклонённые сигналы: чем закончились бы сделки
     python -m trader backtest           проверить стратегию на истории (без LLM и без ключей)
         --days 90                       сколько дней истории
         --variant "имя:UNIVERSE_SIZE=25,MIN_VOLUME_RATIO=1.0"   сравнить с другими настройками
@@ -258,7 +259,10 @@ def cmd_backtest(settings: Settings, args: argparse.Namespace) -> int:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="python -m trader", description="Binance spot бот с Claude")
     parser.add_argument(
-        "command", choices=["check", "once", "run", "status", "report", "close-all", "reset-kill-switch", "reset", "backtest"]
+        "command",
+        choices=[
+            "check", "once", "run", "status", "report", "close-all", "reset-kill-switch", "reset", "backtest", "shadow",
+        ],
     )
     parser.add_argument("--env", default=".env", help="путь к .env (по умолчанию ./.env)")
     parser.add_argument("--yes", action="store_true", help="подтверждение для reset")
@@ -290,6 +294,13 @@ def main(argv: list[str] | None = None) -> int:
         logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(name)s: %(message)s")
         return cmd_backtest(settings, args)
     setup_logging(settings)
+
+    if args.command == "shadow":
+        from .reports import shadow_list_text
+        from .storage import Storage, utcnow
+
+        print(shadow_list_text(Storage(settings.db_path), utcnow()))
+        return 0
 
     if args.command == "reset":
         if not args.yes:

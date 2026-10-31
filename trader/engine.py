@@ -21,7 +21,7 @@ from .news import NewsProvider
 from .notifier import Notifier
 from .reports import EXIT_REASONS, daily_report_text, status_text
 from .risk import AccountState, RiskLimits, RiskManager
-from .storage import Position, Storage, from_iso, to_iso, utcnow
+from .storage import Position, Shadow, Storage, from_iso, to_iso, utcnow
 from .strategy import (
     EntrySignal,
     Features,
@@ -373,7 +373,67 @@ class TradingEngine:
                     self.storage.update_position(pos)
                 if decision.should_exit and self.close_position(pos, decision.reason):
                     closed.append(f"{pos.symbol} ({EXIT_REASONS.get(decision.reason, decision.reason)})")
+        try:
+            self.update_shadows()
+        except Exception:  # noqa: BLE001 — учёт теней не должен мешать стопам
+            log.exception("ошибка учёта отклонённых сигналов")
         self._enforce_limits(self.account_state())
+        return closed
+
+    # ------------------------------------------------------------------ тень
+    def _shadow(self, sig: EntrySignal, source: str, reason: str, confidence: float | None = None) -> None:
+        """Запомнить отклонённый сигнал, чтобы потом посчитать, чем закончилась бы сделка."""
+        if any(sh.symbol == sig.symbol for sh in self.storage.shadows(status="open")):
+            return  # как и бот, вторую позицию по той же паре не открываем
+        shadow = Shadow(
+            signal_id=sig.id,
+            symbol=sig.symbol,
+            source=source,
+            entry_time=self.clock(),
+            entry_price=sig.price,
+            stop_price=sig.stop_price,
+            highest_price=sig.price,
+            atr=sig.atr,
+            reason=reason,
+            confidence=confidence,
+        )
+        if self.storage.add_shadow(shadow):
+            log.info("тень: %s отклонён (%s), следим, чем закончилась бы сделка", sig.symbol, source)
+
+    def update_shadows(self) -> list[Shadow]:
+        """Те же правила выхода, что у настоящих позиций, по тем же ценам. Ордеров нет."""
+        shadows = self.storage.shadows(status="open")
+        if not shadows:
+            return []
+        try:
+            prices = self.data.prices(sorted({sh.symbol for sh in shadows}))
+        except Exception as exc:  # noqa: BLE001
+            log.warning("тень: цены недоступны: %s", exc)
+            return []
+        now = self.clock()
+        costs_pct = 2 * (self.s.paper_fee_pct + self.s.paper_slippage_pct)  # вход и выход
+        closed: list[Shadow] = []
+        for sh in shadows:
+            price = prices.get(sh.symbol)
+            if not price:
+                continue
+            decision = evaluate_exit(
+                entry_price=sh.entry_price,
+                stop_price=sh.stop_price,
+                highest_price=sh.highest_price,
+                atr_at_entry=sh.atr,
+                price=price,
+                held_hours=(now - sh.entry_time).total_seconds() / 3600.0,
+                params=self.params,
+                max_hold_hours=self.s.max_hold_hours,
+            )
+            sh.stop_price, sh.highest_price = decision.stop_price, decision.highest_price
+            if decision.should_exit:
+                sh.status, sh.exit_time, sh.exit_price, sh.exit_reason = "closed", now, price, decision.reason
+                sh.pnl_pct = (price / sh.entry_price - 1.0) * 100.0 - costs_pct
+                closed.append(sh)
+                log.info("тень: %s закрыта бы (%s) %+.2f%%", sh.symbol, decision.reason, sh.pnl_pct)
+            self.storage.update_shadow(sh)
         return closed
 
     def market_regime(self) -> tuple[bool, str]:
@@ -495,6 +555,8 @@ class TradingEngine:
             log.info("фильтр рынка: %s", summary.regime)
             if not allowed_by_regime and signals:
                 summary.rejected.extend(f"{s.symbol}: фильтр рынка ({summary.regime})" for s in signals)
+                for sig in signals:
+                    self._shadow(sig, "regime", summary.regime)
                 signals = []
         log.info("universe=%d, свечи получены для %d, сигналов %d", len(universe), len(candidates), len(signals))
 
@@ -550,10 +612,13 @@ class TradingEngine:
                     if v and v.approve:
                         why = f"уверенность {v.confidence:.0%} ниже порога {self.s.min_llm_confidence:.0%}"
                     summary.rejected.append(f"{sig.symbol}: LLM отклонил ({why})")
+                    self._shadow(sig, "llm", why, v.confidence if v else None)
         elif signals and self.s.llm_fail_mode == "rules":
             approved = [(sig, None, 0.5, "LLM недоступен, вход по правилам с половинным размером") for sig in signals]
         else:
             summary.rejected.extend(f"{sig.symbol}: LLM недоступен ({result.status}), режим hold" for sig in signals)
+            for sig in signals:
+                self._shadow(sig, "hold", f"LLM недоступен ({result.status})")
 
         approved.sort(key=lambda item: item[1] or 0.0, reverse=True)
         held = {p.symbol for p in self.storage.open_positions()}
