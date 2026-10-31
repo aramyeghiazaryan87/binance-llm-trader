@@ -176,7 +176,7 @@ def cmd_backtest(settings: Settings, args: argparse.Namespace) -> int:
             if not frame.empty:
                 daily[symbol] = frame
             if n % 100 == 0:
-                print(f"  {n}/{len(candidates)}")
+                print(f"  {n}/{len(candidates)}", flush=True)
         min_volume = min(cfg.min_quote_volume for _, cfg in variants)
         symbols = select_pool(daily, start, top_n=need * args.pool_margin, min_quote_volume=min_volume)
         delisted = [s for s in symbols if data.markets[s].get("active") is False]
@@ -185,11 +185,13 @@ def cmd_backtest(settings: Settings, args: argparse.Namespace) -> int:
 
     print(f"Загружаю свечи {settings.timeframe} за {args.days} дн. по {len(symbols)} парам...")
     frames = {}
-    for symbol in symbols:
+    for n, symbol in enumerate(symbols, 1):
         try:
             frames[symbol] = fetch_history(data.exchange, symbol, settings.timeframe, since_ms)
         except Exception as exc:  # noqa: BLE001
             print(f"  {symbol}: свечи недоступны ({exc}), пропускаю")
+        if n % 20 == 0:
+            print(f"  {n}/{len(symbols)}", flush=True)
     if dynamic:
         print(f"Период: {start:%Y-%m-%d} — {now:%Y-%m-%d} UTC; список пар пересчитывается каждый час: "
               f"топ по объёму за 24 часа на тот момент")
