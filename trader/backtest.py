@@ -1,0 +1,436 @@
+"""Бэктест стратегии «Трендовый пробой» на истории свечей (без LLM).
+
+Повторяет логику живого бота, используя те же функции:
+  * сигнал: compute_features + entry_signal на окне из CANDLES_LIMIT закрытых свечей,
+    как в engine (EMA зависят от длины окна, поэтому окно то же самое);
+  * вход: по цене закрытия сигнальной свечи + проскальзывание, комиссия как в paper-режиме;
+  * размер и допуск сделки: RiskManager (риск на сделку, лимиты позиций и экспозиции,
+    дневной лимит убытка, аварийная остановка по просадке);
+  * выход: evaluate_exit — стоп-лосс, трейлинг-стоп, стоп по времени; пауза после стоп-лосса.
+
+Внутри часовой свечи порядок цен неизвестен, поэтому проверка стопа осторожная:
+сначала минимум свечи против старого стопа (при гэпе вниз выход по цене открытия),
+затем подтягиваем трейлинг по максимуму и, если закрытие ниже нового стопа, выходим
+по закрытию (живой бот проверяет стопы каждые 5 минут и поймал бы это внутри часа).
+
+Claude здесь не участвует: каждый сигнал считается одобренным с множителем размера
+SIZE_FACTOR. Это проверка самих правил: если они не зарабатывают, фильтр LLM не спасёт.
+"""
+from __future__ import annotations
+
+import logging
+import math
+import time
+from dataclasses import dataclass, field, fields, replace
+from datetime import datetime, timedelta, timezone
+from typing import Any
+
+import pandas as pd
+
+from .indicators import rolling_high, sma
+from .market_data import ohlcv_to_frame
+from .risk import AccountState, RiskLimits, RiskManager
+from .strategy import StrategyParams, compute_features, entry_signal, evaluate_exit, timeframe_minutes
+
+log = logging.getLogger(__name__)
+
+EXIT_NAMES = {
+    "stop_loss": "стоп-лосс",
+    "trailing_stop": "трейлинг-стоп",
+    "time_stop": "по времени",
+    "kill_switch": "аварийная остановка",
+    "end_of_test": "конец теста",
+}
+
+
+@dataclass(frozen=True)
+class BacktestConfig:
+    params: StrategyParams = StrategyParams()
+    limits: RiskLimits = RiskLimits()
+    universe_size: int = 15
+    start_usdt: float = 10_000.0
+    fee_pct: float = 0.1
+    slippage_pct: float = 0.05
+    cooldown_hours: float = 6.0
+    max_hold_hours: float = 96.0
+    size_factor: float = 1.0
+    candles_window: int = 300
+    timeframe: str = "1h"
+
+    @classmethod
+    def from_settings(cls, s: Any) -> "BacktestConfig":
+        return cls(
+            params=StrategyParams(
+                breakout_lookback=s.breakout_lookback,
+                min_volume_ratio=s.min_volume_ratio,
+                atr_stop_mult=s.atr_stop_mult,
+                atr_trail_mult=s.atr_trail_mult,
+            ),
+            limits=RiskLimits(
+                risk_per_trade_pct=s.risk_per_trade_pct,
+                max_position_pct=s.max_position_pct,
+                max_open_positions=s.max_open_positions,
+                max_total_exposure_pct=s.max_total_exposure_pct,
+                daily_loss_limit_pct=s.daily_loss_limit_pct,
+                max_drawdown_pct=s.max_drawdown_pct,
+                min_order_usdt=s.min_order_usdt,
+            ),
+            universe_size=s.universe_size,
+            start_usdt=s.paper_start_usdt,
+            fee_pct=s.paper_fee_pct,
+            slippage_pct=s.paper_slippage_pct,
+            cooldown_hours=s.cooldown_hours,
+            max_hold_hours=s.max_hold_hours,
+            candles_window=s.candles_limit,
+            timeframe=s.timeframe,
+        )
+
+    def with_overrides(self, overrides: dict[str, str]) -> "BacktestConfig":
+        """KEY=VALUE в стиле .env (регистр не важен): поля StrategyParams, RiskLimits или самого конфига."""
+        groups: list[tuple[str, Any]] = [("params", self.params), ("limits", self.limits), ("", self)]
+        changes: dict[str, dict[str, Any]] = {"params": {}, "limits": {}, "": {}}
+        for raw_key, raw_value in overrides.items():
+            key = raw_key.strip().lower()
+            for group, obj in groups:
+                types = {f.name: f.type for f in fields(obj) if f.name not in ("params", "limits")}
+                if key in types:
+                    kind = types[key] if isinstance(types[key], str) else types[key].__name__
+                    try:
+                        value: Any = int(raw_value) if kind == "int" else (
+                            float(raw_value) if kind == "float" else str(raw_value)
+                        )
+                    except ValueError as exc:
+                        raise ValueError(f"{raw_key}: ожидается число, получено {raw_value!r}") from exc
+                    changes[group][key] = value
+                    break
+            else:
+                raise ValueError(f"неизвестный параметр {raw_key!r}")
+        return replace(
+            self,
+            params=replace(self.params, **changes["params"]),
+            limits=replace(self.limits, **changes["limits"]),
+            **changes[""],
+        )
+
+
+def parse_variant(spec: str) -> tuple[str, dict[str, str]]:
+    """'имя:KEY=VAL,KEY=VAL' или 'KEY=VAL,KEY=VAL' (тогда имя = сами настройки)."""
+    name, _, body = spec.partition(":") if ":" in spec else ("", "", spec)
+    overrides: dict[str, str] = {}
+    for part in body.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        key, sep, value = part.partition("=")
+        if not sep or not key.strip():
+            raise ValueError(f"ожидается KEY=VALUE, получено {part!r}")
+        overrides[key.strip()] = value.strip()
+    if not overrides:
+        raise ValueError(f"пустой вариант {spec!r}")
+    return (name.strip() or body.strip()), overrides
+
+
+@dataclass
+class Trade:
+    symbol: str
+    entry_time: datetime
+    entry_price: float  # цена рынка на входе (без проскальзывания)
+    cost: float  # потрачено USDT
+    qty: float
+    atr: float
+    stop: float
+    highest: float
+    exit_time: datetime | None = None
+    exit_price: float | None = None
+    proceeds: float = 0.0
+    reason: str = ""
+
+    @property
+    def pnl(self) -> float:
+        return self.proceeds - self.cost
+
+    @property
+    def pnl_pct(self) -> float:
+        return self.pnl / self.cost * 100.0 if self.cost else 0.0
+
+    @property
+    def hold_hours(self) -> float:
+        end = self.exit_time or self.entry_time
+        return (end - self.entry_time).total_seconds() / 3600.0
+
+
+@dataclass
+class BacktestResult:
+    config: BacktestConfig
+    symbols: list[str]
+    start: datetime
+    end: datetime
+    trades: list[Trade] = field(default_factory=list)
+    equity: list[tuple[datetime, float]] = field(default_factory=list)
+    signals: int = 0
+    skipped: dict[str, int] = field(default_factory=dict)
+    kill_switch_time: datetime | None = None
+    benchmark_pct: float | None = None  # BTC buy & hold за тот же период
+
+    @property
+    def weeks(self) -> float:
+        return max((self.end - self.start).total_seconds() / (7 * 86_400), 1e-9)
+
+    @property
+    def final_equity(self) -> float:
+        return self.equity[-1][1] if self.equity else self.config.start_usdt
+
+    @property
+    def return_pct(self) -> float:
+        return (self.final_equity / self.config.start_usdt - 1.0) * 100.0
+
+    @property
+    def max_drawdown_pct(self) -> float:
+        peak, worst = -math.inf, 0.0
+        for _, value in self.equity:
+            peak = max(peak, value)
+            if peak > 0:
+                worst = max(worst, (1.0 - value / peak) * 100.0)
+        return worst
+
+    @property
+    def win_rate(self) -> float:
+        return sum(t.pnl > 0 for t in self.trades) / len(self.trades) * 100.0 if self.trades else 0.0
+
+    @property
+    def avg_trade_pct(self) -> float:
+        return sum(t.pnl_pct for t in self.trades) / len(self.trades) if self.trades else 0.0
+
+    @property
+    def profit_factor(self) -> float:
+        gains = sum(t.pnl for t in self.trades if t.pnl > 0)
+        losses = -sum(t.pnl for t in self.trades if t.pnl < 0)
+        if losses == 0:
+            return math.inf if gains > 0 else 0.0
+        return gains / losses
+
+    @property
+    def exit_reasons(self) -> dict[str, int]:
+        counts: dict[str, int] = {}
+        for t in self.trades:
+            counts[t.reason] = counts.get(t.reason, 0) + 1
+        return counts
+
+
+def _prefilter(df: pd.DataFrame, params: StrategyParams) -> pd.Series:
+    """Быстрый отсев: пробой и объём не зависят от длины окна, их можно посчитать сразу по всей истории.
+
+    Полную проверку (EMA, RSI, ATR) делает entry_signal только там, где отсев пройден.
+    """
+    level = rolling_high(df["high"], params.breakout_lookback)
+    vol_avg = sma(df["volume"].shift(1), params.volume_lookback)
+    return (df["close"] > level) & (df["volume"] >= params.min_volume_ratio * vol_avg)
+
+
+def run_backtest(
+    frames: dict[str, pd.DataFrame],
+    config: BacktestConfig,
+    start: datetime,
+    end: datetime | None = None,
+) -> BacktestResult:
+    """frames: свечи по парам в порядке приоритета (ликвидности), включая историю для разогрева индикаторов."""
+    cfg = config
+    params = cfg.params
+    risk = RiskManager(cfg.limits)
+    fee = cfg.fee_pct / 100.0
+    slip = cfg.slippage_pct / 100.0
+    tf = timedelta(minutes=timeframe_minutes(cfg.timeframe))
+    symbols = [s for s in frames if not frames[s].empty][: cfg.universe_size]
+    if start.tzinfo is None:
+        start = start.replace(tzinfo=timezone.utc)
+
+    times = sorted({ts for s in symbols for ts in frames[s].index if ts >= start and (end is None or ts < end)})
+    result = BacktestResult(cfg, symbols, start, end or start)
+    if not times:
+        return result
+    result.end = times[-1] + tf
+
+    positions_idx = {s: {ts: i for i, ts in enumerate(frames[s].index)} for s in symbols}
+    prefilter = {s: _prefilter(frames[s], params).to_numpy() for s in symbols}
+    last_close: dict[str, float] = {}
+    cash = cfg.start_usdt
+    open_trades: dict[str, Trade] = {}
+    cooldowns: dict[str, datetime] = {}
+    peak = cfg.start_usdt
+    day, day_start_equity, daily_blocked = None, cfg.start_usdt, False
+    kill = False
+
+    def close_trade(trade: Trade, price: float, when: datetime, reason: str) -> None:
+        nonlocal cash
+        fill = price * (1 - slip)
+        trade.exit_price = price
+        trade.exit_time = when
+        trade.proceeds = trade.qty * fill * (1 - fee)
+        trade.reason = reason
+        cash += trade.proceeds
+        result.trades.append(trade)
+        del open_trades[trade.symbol]
+        if reason == "stop_loss" and cfg.cooldown_hours > 0:
+            cooldowns[trade.symbol] = when + timedelta(hours=cfg.cooldown_hours)
+
+    def skip(reason: str) -> None:
+        result.skipped[reason] = result.skipped.get(reason, 0) + 1
+
+    for ts in times:
+        bar_close = ts + tf
+        # 1. стопы открытых позиций по свече ts
+        for symbol in list(open_trades):
+            i = positions_idx[symbol].get(ts)
+            if i is None:
+                continue
+            bar = frames[symbol].iloc[i]
+            trade = open_trades[symbol]
+            o, h, low, c = float(bar["open"]), float(bar["high"]), float(bar["low"]), float(bar["close"])
+            if low <= trade.stop:
+                reason = "trailing_stop" if trade.stop > trade.entry_price else "stop_loss"
+                close_trade(trade, min(o, trade.stop), bar_close, reason)
+                continue
+            decision = evaluate_exit(
+                entry_price=trade.entry_price,
+                stop_price=trade.stop,
+                highest_price=max(trade.highest, h),
+                atr_at_entry=trade.atr,
+                price=c,
+                held_hours=(bar_close - trade.entry_time).total_seconds() / 3600.0,
+                params=params,
+                max_hold_hours=cfg.max_hold_hours,
+            )
+            trade.stop, trade.highest = decision.stop_price, decision.highest_price
+            if decision.should_exit:
+                close_trade(trade, c, bar_close, decision.reason)
+
+        # 2. оценка капитала на закрытии свечи
+        for symbol in symbols:
+            i = positions_idx[symbol].get(ts)
+            if i is not None:
+                last_close[symbol] = float(frames[symbol]["close"].iloc[i])
+        value = sum(t.qty * last_close.get(t.symbol, t.entry_price) for t in open_trades.values())
+        equity = cash + value
+        if bar_close.date() != day:
+            day, day_start_equity, daily_blocked = bar_close.date(), equity, False
+        peak = max(peak, equity)
+        drawdown = (1.0 - equity / peak) * 100.0 if peak > 0 else 0.0
+        day_pnl = (equity / day_start_equity - 1.0) * 100.0 if day_start_equity > 0 else 0.0
+        if not daily_blocked and risk.daily_loss_hit(day_pnl):
+            daily_blocked = True
+        if not kill and risk.drawdown_hit(drawdown):
+            kill = True
+            result.kill_switch_time = bar_close
+            for symbol in list(open_trades):
+                close_trade(open_trades[symbol], last_close[symbol], bar_close, "kill_switch")
+            equity = cash
+        result.equity.append((bar_close, equity))
+
+        # 3. сигналы на закрытой свече ts и входы по её закрытию
+        for symbol in symbols:
+            i = positions_idx[symbol].get(ts)
+            if i is None or not prefilter[symbol][i] or i + 1 < cfg.candles_window:
+                continue
+            window = frames[symbol].iloc[i + 1 - cfg.candles_window : i + 1]
+            features = compute_features(symbol, window, params, cfg.timeframe)
+            sig = entry_signal(features, params) if features else None
+            if sig is None:
+                continue
+            if symbol in open_trades:
+                continue  # живой бот не считает сигналом пару, по которой уже есть позиция
+            until = cooldowns.get(symbol)
+            if until and until > bar_close:
+                continue
+            result.signals += 1
+            positions_value = sum(t.qty * last_close.get(t.symbol, t.entry_price) for t in open_trades.values())
+            account = AccountState(
+                equity=cash + positions_value,
+                cash=cash,
+                positions_value=positions_value,
+                open_positions=len(open_trades),
+                day_pnl_pct=day_pnl,
+                drawdown_pct=drawdown,
+                kill_switch=kill,
+                daily_blocked=daily_blocked,
+            )
+            gate = risk.can_open(account, symbol, set(open_trades), cooldowns, bar_close)
+            if not gate.ok:
+                skip("аварийная остановка" if kill else "дневной лимит" if daily_blocked else "лимит позиций")
+                continue
+            price = sig.price
+            stop = price - params.atr_stop_mult * sig.atr
+            sizing = risk.size_position(
+                account, price=price, stop_price=stop, size_factor=cfg.size_factor, min_cost=0.0, free_quote=cash
+            )
+            if not sizing.ok:
+                skip("нет свободных средств")
+                continue
+            amount = sizing.amount_usdt
+            qty = amount / (price * (1 + slip)) * (1 - fee)
+            cash -= amount
+            open_trades[symbol] = Trade(symbol, bar_close, price, amount, qty, sig.atr, stop, price)
+
+    end_time = result.end
+    for symbol in list(open_trades):
+        close_trade(open_trades[symbol], last_close[symbol], end_time, "end_of_test")
+    if result.equity:
+        result.equity[-1] = (result.equity[-1][0], cash)
+
+    btc = next((s for s in ("BTC/USDT", "BTC/USDC") if s in frames), None)
+    if btc:
+        period = frames[btc][(frames[btc].index >= start) & (frames[btc].index < end_time)]
+        if not period.empty and period["open"].iloc[0] > 0:
+            result.benchmark_pct = (float(period["close"].iloc[-1]) / float(period["open"].iloc[0]) - 1.0) * 100.0
+    return result
+
+
+def fetch_history(exchange: Any, symbol: str, timeframe: str, since_ms: int, now_ms: int | None = None) -> pd.DataFrame:
+    """Все закрытые свечи с since_ms до текущего момента, постранично по 1000 штук."""
+    now_ms = int(time.time() * 1000) if now_ms is None else now_ms
+    step = timeframe_minutes(timeframe) * 60_000
+    rows: list[list[float]] = []
+    cursor = since_ms
+    while cursor < now_ms:
+        batch = exchange.fetch_ohlcv(symbol, timeframe=timeframe, since=cursor, limit=1000)
+        if not batch:
+            break
+        rows.extend(batch)
+        next_cursor = int(batch[-1][0]) + step
+        if next_cursor <= cursor:
+            break
+        cursor = next_cursor
+    return ohlcv_to_frame(rows, timeframe, now_ms=now_ms)
+
+
+def format_result(result: BacktestResult, title: str = "") -> str:
+    r = result
+    trades = len(r.trades)
+    pf = "∞" if math.isinf(r.profit_factor) else f"{r.profit_factor:.2f}"
+    lines = [
+        f"=== {title or 'текущие настройки'} ===",
+        f"Сделок: {trades} ({trades / r.weeks:.1f} в неделю), сигналов: {r.signals}",
+        f"Прибыльных: {r.win_rate:.0f}%, средняя сделка {r.avg_trade_pct:+.2f}% (после комиссий), profit factor {pf}",
+        f"Итог: {r.return_pct:+.2f}% ({r.config.start_usdt:,.0f} → {r.final_equity:,.0f} USDT), "
+        f"макс. просадка {r.max_drawdown_pct:.2f}%",
+    ]
+    if trades:
+        avg_hold = sum(t.hold_hours for t in r.trades) / trades
+        reasons = ", ".join(f"{EXIT_NAMES.get(k, k)} {v}" for k, v in sorted(r.exit_reasons.items(), key=lambda x: -x[1]))
+        lines.append(f"Среднее удержание: {avg_hold:.0f} ч; выходы: {reasons}")
+    if r.skipped:
+        lines.append("Пропущено сигналов: " + ", ".join(f"{k} {v}" for k, v in r.skipped.items()))
+    if r.kill_switch_time:
+        lines.append(f"⛔ Аварийная остановка по просадке: {r.kill_switch_time:%Y-%m-%d %H:%M} UTC")
+    return "\n".join(lines)
+
+
+def format_comparison(results: list[tuple[str, BacktestResult]]) -> str:
+    header = f"{'вариант':<34} {'сделок':>6} {'в нед.':>6} {'приб.%':>6} {'сред.%':>7} {'PF':>5} {'итог%':>7} {'просадка%':>9}"
+    lines = [header, "-" * len(header)]
+    for name, r in results:
+        pf = "∞" if math.isinf(r.profit_factor) else f"{r.profit_factor:.2f}"
+        lines.append(
+            f"{name[:34]:<34} {len(r.trades):>6} {len(r.trades) / r.weeks:>6.1f} {r.win_rate:>6.0f} "
+            f"{r.avg_trade_pct:>+7.2f} {pf:>5} {r.return_pct:>+7.2f} {r.max_drawdown_pct:>9.2f}"
+        )
+    return "\n".join(lines)

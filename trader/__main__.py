@@ -8,6 +8,9 @@
     python -m trader close-all          продать все позиции бота
     python -m trader reset-kill-switch  снять аварийную остановку
     python -m trader reset --yes        удалить базу состояния (только без открытых позиций)
+    python -m trader backtest           проверить стратегию на истории (без LLM и без ключей)
+        --days 90                       сколько дней истории
+        --variant "имя:UNIVERSE_SIZE=25,MIN_VOLUME_RATIO=1.0"   сравнить с другими настройками
 """
 from __future__ import annotations
 
@@ -111,18 +114,91 @@ def cmd_check(engine) -> int:
     return 0 if ok else 1
 
 
+def cmd_backtest(settings: Settings, args: argparse.Namespace) -> int:
+    import time
+    from datetime import datetime, timedelta, timezone
+
+    from .backtest import BacktestConfig, fetch_history, format_comparison, format_result, parse_variant, run_backtest
+    from .market_data import MarketData, make_binance
+    from .strategy import timeframe_minutes
+
+    base = BacktestConfig.from_settings(settings)
+    try:
+        variants = [("текущие настройки", base)]
+        for spec in args.variant or []:
+            name, overrides = parse_variant(spec)
+            variants.append((name, base.with_overrides(overrides)))
+    except ValueError as exc:
+        print(f"Ошибка в --variant: {exc}", file=sys.stderr)
+        return 2
+    if args.days <= 0:
+        print("--days должно быть больше 0", file=sys.stderr)
+        return 2
+
+    data = MarketData(make_binance(public_url=settings.market_data_url), name="mainnet")
+    if args.symbols:
+        symbols = [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
+    else:
+        need = max(cfg.universe_size for _, cfg in variants)
+        symbols = data.top_symbols(quote=settings.quote_asset, limit=need, min_quote_volume=settings.min_quote_volume)
+    now = datetime.now(timezone.utc)
+    start = (now - timedelta(days=args.days)).replace(minute=0, second=0, microsecond=0)
+    warmup = timedelta(minutes=timeframe_minutes(settings.timeframe) * (max(c.candles_window for _, c in variants) + 5))
+    since_ms = int((start - warmup).timestamp() * 1000)
+
+    print(f"Загружаю свечи {settings.timeframe} за {args.days} дн. по {len(symbols)} парам...")
+    frames = {}
+    for symbol in symbols:
+        try:
+            frames[symbol] = fetch_history(data.exchange, symbol, settings.timeframe, since_ms)
+        except Exception as exc:  # noqa: BLE001
+            print(f"  {symbol}: свечи недоступны ({exc}), пропускаю")
+    print(f"Период: {start:%Y-%m-%d} — {now:%Y-%m-%d} UTC; пары по убыванию объёма: {', '.join(frames)}")
+    print("Claude не участвует: каждый сигнал считается одобренным. Комиссия "
+          f"{base.fee_pct}% + проскальзывание {base.slippage_pct}% на каждую сторону.\n")
+
+    results = []
+    for name, cfg in variants:
+        t0 = time.time()
+        result = run_backtest(frames, cfg, start)
+        results.append((name, result))
+        print(format_result(result, name))
+        log.debug("вариант %s посчитан за %.1f с", name, time.time() - t0)
+        print()
+    if len(results) > 1:
+        print(format_comparison(results))
+        print()
+    bench = results[0][1].benchmark_pct
+    if bench is not None:
+        print(f"Для сравнения: BTC купить и держать за период {bench:+.2f}%")
+    print("Пары выбраны по сегодняшнему объёму, поэтому результат немного оптимистичен "
+          "(в прошлом список лидеров был другим).")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="python -m trader", description="Binance spot бот с Claude")
-    parser.add_argument("command", choices=["check", "once", "run", "status", "report", "close-all", "reset-kill-switch", "reset"])
+    parser.add_argument(
+        "command", choices=["check", "once", "run", "status", "report", "close-all", "reset-kill-switch", "reset", "backtest"]
+    )
     parser.add_argument("--env", default=".env", help="путь к .env (по умолчанию ./.env)")
     parser.add_argument("--yes", action="store_true", help="подтверждение для reset")
+    parser.add_argument("--days", type=int, default=90, help="backtest: дней истории (по умолчанию 90)")
+    parser.add_argument("--symbols", default="", help="backtest: свои пары через запятую вместо топа по объёму")
+    parser.add_argument(
+        "--variant", action="append", help='backtest: "имя:KEY=VALUE,KEY=VALUE" — сравнить с другими настройками'
+    )
     args = parser.parse_args(argv)
 
     try:
-        settings = Settings.from_env(args.env)
+        # бэктесту ключи биржи не нужны: проверку настроек режима пропускаем
+        settings = Settings.from_env(args.env, validate=args.command != "backtest")
     except ConfigError as exc:
         print(exc, file=sys.stderr)
         return 2
+    if args.command == "backtest":
+        logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(name)s: %(message)s")
+        return cmd_backtest(settings, args)
     setup_logging(settings)
 
     if args.command == "reset":

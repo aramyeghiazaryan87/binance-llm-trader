@@ -130,7 +130,7 @@ class Settings:
     log_level: str = "INFO"
 
     @classmethod
-    def from_env(cls, env_file: str | os.PathLike | None = ".env") -> "Settings":
+    def from_env(cls, env_file: str | os.PathLike | None = ".env", validate: bool = True) -> "Settings":
         if env_file and Path(env_file).exists():
             load_dotenv(env_file, override=False)
 
@@ -202,7 +202,7 @@ class Settings:
             data_dir=Path(_str("DATA_DIR", "data")),
             log_level=_str("LOG_LEVEL", "INFO").upper(),
         )
-        problems = settings.problems()
+        problems = settings.problems() if validate else []
         if problems:
             raise ConfigError("Ошибки конфигурации:\n- " + "\n- ".join(problems))
         return settings

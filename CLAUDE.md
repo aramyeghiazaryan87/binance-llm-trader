@@ -6,6 +6,7 @@ Binance spot бот: стратегия трендового пробоя (`trad
 - Тесты (офлайн, без ключей): `python -m pytest -q`
 - Проверка подключений: `python -m trader check`
 - Один цикл: `python -m trader once`; постоянно: `python -m trader run`
+- Бэктест (без LLM и ключей): `MARKET_DATA_URL=https://data-api.binance.vision python -m trader backtest --days 90 [--variant "имя:KEY=VAL,..."]`
 - Зависимости: `python3 -m venv .venv && .venv/bin/pip install -r requirements-dev.txt`
 
 ## Облачная сессия Claude Code
