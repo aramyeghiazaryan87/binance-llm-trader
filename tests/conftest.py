@@ -138,6 +138,28 @@ def approving_responder(confidence: float = 0.8, size_factor: float = 0.8, close
     return respond
 
 
+def rejecting_responder(confidence: float = 0.7, reason: str = "RSI 71 extended, mixed trend"):
+    """Фейковый Claude: отклоняет все сигналы."""
+
+    def respond(kwargs):
+        prompt = kwargs["messages"][0]["content"]
+        assessment = MarketAssessment(
+            market_regime="risk_off",
+            news_sentiment=-0.3,
+            news_summary="Exchange hack weighs on sentiment.",
+            watchlist=[],
+            signal_verdicts=[
+                SignalVerdict(signal_id=sid, approve=False, confidence=confidence, size_factor=0.25, reason=reason)
+                for sid, _ in SIGNAL_RE.findall(prompt)
+            ],
+            position_advice=[],
+            report="Рынок осторожный, сигнал отклонён.",
+        )
+        return FakeResponse(assessment)
+
+    return respond
+
+
 class FakeUsage:
     def __init__(self, input_tokens=1500, output_tokens=700, iterations=None):
         self.input_tokens = input_tokens

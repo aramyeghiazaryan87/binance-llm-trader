@@ -1,11 +1,12 @@
 """Текстовые отчёты: статус и дневной отчёт."""
 from __future__ import annotations
 
+from collections import Counter
 from datetime import datetime, timedelta
 
 from .budget import BudgetGuard
 from .risk import AccountState
-from .storage import Position, Storage
+from .storage import Position, Shadow, Storage
 
 EXIT_REASONS = {
     "stop_loss": "стоп-лосс",
@@ -16,6 +17,64 @@ EXIT_REASONS = {
     "manual": "вручную",
     "reconcile": "сверка с биржей",
 }
+
+
+SHADOW_SOURCES = {"llm": "Claude", "regime": "фильтр рынка", "hold": "Claude недоступен"}
+
+
+def _mean(values: list[float]) -> float:
+    return sum(values) / len(values) if values else 0.0
+
+
+def shadow_summary_lines(storage: Storage, now: datetime) -> list[str]:
+    """Итоги по отклонённым сигналам рядом с настоящими сделками. Пусто, если отказов ещё не было."""
+    new = storage.shadows(since=now - timedelta(hours=24))
+    open_now = storage.shadows(status="open")
+    closed = storage.shadows(status="closed")
+    if not (new or open_now or closed):
+        return []
+    lines = ["Отклонённые сигналы (что было бы при входе, без ордеров):"]
+    if new:
+        counts = Counter(SHADOW_SOURCES.get(s.source, s.source) for s in new)
+        lines.append("за сутки отклонено: " + ", ".join(f"{name} {n}" for name, n in counts.items()))
+    lines.append(f"ещё не закрыто: {len(open_now)}")
+    if closed:
+        pnl = [s.pnl_pct or 0.0 for s in closed]
+        wins = sum(1 for p in pnl if p > 0)
+        lines.append(
+            f"закрыто всего: {len(closed)}, прибыльных {wins / len(closed) * 100:.0f}%, "
+            f"в среднем {_mean(pnl):+.2f}% на сделку"
+        )
+        for source, name in SHADOW_SOURCES.items():
+            group = [s.pnl_pct or 0.0 for s in closed if s.source == source]
+            if group:
+                lines.append(f"• отклонил {name}: {len(group)}, в среднем {_mean(group):+.2f}%")
+    real = storage.closed_positions()
+    if real:
+        lines.append(
+            f"настоящие сделки для сравнения: {len(real)}, в среднем {_mean([p.pnl_pct or 0.0 for p in real]):+.2f}%"
+        )
+    return lines
+
+
+def shadow_line(sh: Shadow) -> str:
+    head = f"• {sh.entry_time:%Y-%m-%d %H:%M} UTC {sh.symbol}, отклонил {SHADOW_SOURCES.get(sh.source, sh.source)}"
+    if sh.status == "closed" and sh.exit_price is not None:
+        body = (
+            f"вход {sh.entry_price:.6g} → выход {sh.exit_price:.6g} "
+            f"({EXIT_REASONS.get(sh.exit_reason or '', sh.exit_reason)}), {sh.pnl_pct:+.2f}%"
+        )
+    else:
+        body = f"вход {sh.entry_price:.6g}, стоп {sh.stop_price:.6g}, ещё не закрыта"
+    confidence = f", уверенность Claude {sh.confidence:.0%}" if sh.confidence is not None else ""
+    return f"{head}: {body}. Причина: {sh.reason}{confidence}"
+
+
+def shadow_list_text(storage: Storage, now: datetime) -> str:
+    shadows = storage.shadows()
+    if not shadows:
+        return "Отклонённых сигналов пока не было"
+    return "\n".join([shadow_line(sh) for sh in shadows] + [""] + shadow_summary_lines(storage, now))
 
 
 def fmt_money(value: float) -> str:
@@ -94,6 +153,10 @@ def daily_report_text(
         wins = sum(1 for p in all_closed if (p.pnl_usdt or 0) > 0)
         lines.append(f"Всего закрыто: {len(all_closed)}, прибыльных {wins / len(all_closed) * 100:.0f}%")
     lines.append(f"LLM за сутки: {len(llm_calls)} вызовов ({llm_ok} успешных), ${llm_cost:.3f}")
+
+    shadow = shadow_summary_lines(storage, now)
+    if shadow:
+        lines.extend(["", *shadow])
 
     last = next(storage.decisions(kind="llm", limit=1), None)
     if last:

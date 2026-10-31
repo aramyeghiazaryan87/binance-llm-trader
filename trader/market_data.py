@@ -3,7 +3,8 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import Any
+from collections.abc import Callable
+from typing import Any, TypeVar
 
 import ccxt
 import pandas as pd
@@ -11,6 +12,30 @@ import pandas as pd
 from .strategy import timeframe_minutes
 
 log = logging.getLogger(__name__)
+
+T = TypeVar("T")
+
+
+def with_retries(call: Callable[[], T], *, what: str = "запрос", attempts: int = 3, base_delay: float = 2.0) -> T:
+    """Повтор чтения данных при сетевом сбое (таймаут, обрыв, ошибка TLS, лимит запросов): 2, 4, 8 с.
+
+    Только для запросов, которые ничего не меняют на бирже. Ордера так повторять нельзя:
+    при обрыве после отправки можно купить дважды.
+    """
+    for attempt in range(1, attempts + 1):
+        try:
+            return call()
+        except ccxt.NetworkError as exc:
+            if attempt == attempts:
+                raise
+            delay = base_delay * 2 ** (attempt - 1)
+            cause = exc.__cause__ or exc.__context__
+            log.warning(
+                "%s: сбой сети (%s%s), повтор %d из %d через %.0f с",
+                what, type(exc).__name__, f": {type(cause).__name__}" if cause else "", attempt, attempts - 1, delay,
+            )
+            time.sleep(delay)
+    raise AssertionError("unreachable")
 
 # Стейблкоины, фиат и обёрнутые токены: торговать ими против USDT смысла нет.
 EXCLUDED_BASES = frozenset(
@@ -130,7 +155,7 @@ class MarketData:
 
     def load_markets(self, force: bool = False) -> None:
         if force or not self.exchange.markets or time.time() - self._markets_loaded_at > 86_400:
-            self.exchange.load_markets(reload=force)
+            with_retries(lambda: self.exchange.load_markets(reload=force), what=f"{self.name}: список пар")
             self._markets_loaded_at = time.time()
 
     @property
@@ -144,17 +169,20 @@ class MarketData:
     def top_symbols(
         self, *, quote: str, limit: int, min_quote_volume: float, allowed: set[str] | None = None
     ) -> list[str]:
-        tickers = self.exchange.fetch_tickers()
+        tickers = with_retries(self.exchange.fetch_tickers, what=f"{self.name}: тикеры")
         return select_universe(
             tickers, self.markets, quote=quote, limit=limit, min_quote_volume=min_quote_volume, allowed=allowed
         )
 
     def ohlcv(self, symbol: str, timeframe: str, limit: int) -> pd.DataFrame:
-        rows = self.exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit + 1)
+        rows = with_retries(
+            lambda: self.exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit + 1),
+            what=f"{self.name}: свечи {symbol}",
+        )
         return ohlcv_to_frame(rows, timeframe)
 
     def price(self, symbol: str) -> float:
-        ticker = self.exchange.fetch_ticker(symbol)
+        ticker = with_retries(lambda: self.exchange.fetch_ticker(symbol), what=f"{self.name}: цена {symbol}")
         value = ticker.get("last") or ticker.get("close")
         if not value:
             raise ValueError(f"нет цены для {symbol}")

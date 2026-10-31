@@ -20,6 +20,7 @@ from .conftest import (
     FakeNotifier,
     approving_responder,
     make_candles,
+    rejecting_responder,
 )
 
 
@@ -42,6 +43,7 @@ def build(settings, now, *, responder=None, storage=None, exchange=None):
         client = FakeClaude(responder)
         advisor = LLMAdvisor(storage=storage, budget=BudgetGuard(storage, settings.llm_monthly_budget_usd),
                              model=settings.llm_model, effort=settings.llm_effort, max_tokens=settings.llm_max_tokens,
+                             effort_signals=settings.llm_effort_signals,
                              max_watchlist=settings.max_watchlist, client=client)
     clock = Clock(now)
     notifier = FakeNotifier()
@@ -197,3 +199,81 @@ def test_regime_filter_fails_safe_without_data(settings, now):
     summary = engine.run_hourly_cycle()
     assert summary.opened == []
     assert "входы запрещены" in summary.regime
+
+
+def test_rejected_signal_is_tracked_in_shadow(settings, now):
+    engine, exchange, clock, _, _ = build(settings, now, responder=rejecting_responder())
+    engine.startup()
+    summary = engine.run_hourly_cycle()
+    assert summary.opened == [] and engine.storage.open_positions() == []
+
+    [shadow] = engine.storage.shadows(status="open")
+    assert (shadow.symbol, shadow.source, shadow.confidence) == ("SOL/USDT", "llm", 0.7)
+    assert shadow.reason == "RSI 71 extended, mixed trend"
+    assert shadow.stop_price < shadow.entry_price
+
+    # повтор цикла в том же часе (Claude пропущен) не создаёт вторую тень
+    clock.advance(minutes=10)
+    engine.run_hourly_cycle()
+    assert len(engine.storage.shadows()) == 1
+
+    # цена падает на 10%: тень закрывается по стопу, как закрылась бы настоящая позиция
+    entry = shadow.entry_price
+    exchange.prices["SOL/USDT"] = entry * 0.9
+    clock.advance(minutes=5)
+    engine.run_risk_check()
+    [closed] = engine.storage.shadows(status="closed")
+    assert closed.exit_reason == "stop_loss"
+    assert closed.pnl_pct == pytest.approx(-10.0 - 0.3)  # минус комиссия и проскальзывание на входе и выходе
+    assert engine.storage.open_positions() == []  # ордеров не было
+
+    report = engine.send_daily_report()
+    assert "Отклонённые сигналы" in report
+    assert "за сутки отклонено: Claude 1" in report
+    assert "• отклонил Claude: 1, в среднем -10.30%" in report
+
+
+def test_shadow_trailing_stop_keeps_profit(settings, now):
+    engine, exchange, clock, _, _ = build(settings, now, responder=rejecting_responder())
+    engine.startup()
+    engine.run_hourly_cycle()
+    [shadow] = engine.storage.shadows(status="open")
+    entry, atr = shadow.entry_price, shadow.atr
+
+    exchange.prices["SOL/USDT"] = entry + 10 * atr  # сильный рост: трейлинг подтягивается
+    clock.advance(minutes=5)
+    engine.run_risk_check()
+    assert engine.storage.shadows(status="closed") == []
+
+    exchange.prices["SOL/USDT"] = entry + 6 * atr  # откат ниже трейлинга (максимум - 3 ATR)
+    clock.advance(minutes=5)
+    engine.run_risk_check()
+    [closed] = engine.storage.shadows(status="closed")
+    assert closed.exit_reason == "trailing_stop" and closed.pnl_pct > 0
+
+
+def test_regime_and_hold_rejections_are_tracked(settings, now):
+    s = replace(settings, regime_filter=True, regime_ema=50)
+    engine, *_ = build(s, now, responder=approving_responder(), exchange=regime_exchange(-0.002))
+    engine.startup()
+    engine.run_hourly_cycle()
+    [shadow] = engine.storage.shadows()
+    assert shadow.source == "regime" and "BTC ниже дневной EMA50" in shadow.reason
+
+    separate_db = settings.data_dir / "hold"
+    hold, *_ = build(replace(settings, data_dir=separate_db, llm_enabled=False, llm_fail_mode="hold"), now)
+    hold.startup()
+    hold.run_hourly_cycle()
+    [held] = hold.storage.shadows()
+    assert held.source == "hold" and held.confidence is None
+
+
+def test_shadow_list_text(settings, now):
+    from trader.reports import shadow_list_text
+
+    engine, exchange, clock, _, _ = build(settings, now, responder=rejecting_responder())
+    engine.startup()
+    assert shadow_list_text(engine.storage, now) == "Отклонённых сигналов пока не было"
+    engine.run_hourly_cycle()
+    text = shadow_list_text(engine.storage, now)
+    assert "SOL/USDT, отклонил Claude" in text and "ещё не закрыта" in text and "уверенность Claude 70%" in text

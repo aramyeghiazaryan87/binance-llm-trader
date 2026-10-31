@@ -34,11 +34,10 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-import ccxt
 import pandas as pd
 
 from .indicators import rolling_high, sma
-from .market_data import ohlcv_to_frame
+from .market_data import ohlcv_to_frame, with_retries
 from .risk import AccountState, RiskLimits, RiskManager
 from .strategy import StrategyParams, compute_features, entry_signal, evaluate_exit, regime_series, timeframe_minutes
 
@@ -556,20 +555,6 @@ def select_pool(daily: dict[str, pd.DataFrame], start: datetime, top_n: int, min
     return sorted(chosen, key=lambda s: -totals[s])
 
 
-def _with_retries(call: Callable[[], Any], attempts: int = 4, base_delay: float = 2.0) -> Any:
-    """Повтор при сетевых сбоях и лимите запросов (2, 4, 8 с). Ошибки вроде «нет такой пары» не повторяем."""
-    for attempt in range(attempts):
-        try:
-            return call()
-        except (ccxt.NetworkError, ccxt.RateLimitExceeded) as exc:
-            if attempt == attempts - 1:
-                raise
-            delay = base_delay * 2**attempt
-            log.debug("сбой запроса (%s), повтор через %.0f с", exc, delay)
-            time.sleep(delay)
-    return None
-
-
 def fetch_history(exchange: Any, symbol: str, timeframe: str, since_ms: int, now_ms: int | None = None) -> pd.DataFrame:
     """Все закрытые свечи с since_ms до текущего момента, постранично по 1000 штук."""
     now_ms = int(time.time() * 1000) if now_ms is None else now_ms
@@ -577,7 +562,11 @@ def fetch_history(exchange: Any, symbol: str, timeframe: str, since_ms: int, now
     rows: list[list[float]] = []
     cursor = since_ms
     while cursor < now_ms:
-        batch = _with_retries(lambda: exchange.fetch_ohlcv(symbol, timeframe=timeframe, since=cursor, limit=1000))
+        batch = with_retries(
+            lambda: exchange.fetch_ohlcv(symbol, timeframe=timeframe, since=cursor, limit=1000),
+            what=f"история {symbol}",
+            attempts=4,
+        )
         if not batch:
             break
         rows.extend(batch)
