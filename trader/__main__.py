@@ -8,6 +8,11 @@
     python -m trader close-all          продать все позиции бота
     python -m trader reset-kill-switch  снять аварийную остановку
     python -m trader reset --yes        удалить базу состояния (только без открытых позиций)
+    python -m trader backtest           проверить стратегию на истории (без LLM и без ключей)
+        --days 90                       сколько дней истории
+        --variant "имя:UNIVERSE_SIZE=25,MIN_VOLUME_RATIO=1.0"   сравнить с другими настройками
+        --universe today                пары по сегодняшнему объёму (быстрее, но оптимистично)
+        --kill-reset-days 3             снимать аварийную остановку через 3 дня (0 = никогда)
 """
 from __future__ import annotations
 
@@ -111,18 +116,179 @@ def cmd_check(engine) -> int:
     return 0 if ok else 1
 
 
+def cmd_backtest(settings: Settings, args: argparse.Namespace) -> int:
+    import time
+    from datetime import datetime, timedelta, timezone
+
+    from dataclasses import replace
+
+    from .backtest import (
+        BacktestConfig,
+        CandleCache,
+        fetch_many,
+        format_breakdown,
+        format_comparison,
+        format_result,
+        monthly_breakdown,
+        parse_variant,
+        run_backtest,
+        select_pool,
+    )
+    from .market_data import MarketData, is_tradeable_base, make_binance
+    from .strategy import timeframe_minutes
+
+    dynamic = args.universe == "dynamic"
+    base = replace(
+        BacktestConfig.from_settings(settings),
+        dynamic_universe=dynamic,
+        kill_switch_reset_hours=max(args.kill_reset_days, 0.0) * 24.0,
+    )
+    try:
+        variants = [("текущие настройки", base)]
+        for spec in args.variant or []:
+            name, overrides = parse_variant(spec)
+            variants.append((name, base.with_overrides(overrides)))
+    except ValueError as exc:
+        print(f"Ошибка в --variant: {exc}", file=sys.stderr)
+        return 2
+    if args.days <= 0:
+        print("--days должно быть больше 0", file=sys.stderr)
+        return 2
+
+    def make_exchange():
+        return make_binance(public_url=settings.market_data_url)
+
+    data = MarketData(make_exchange(), name="mainnet")
+    cache = CandleCache(None if args.no_cache else settings.data_dir / "candles")
+
+    def progress(every: int):
+        def report(done: int, total: int) -> None:
+            if done % every == 0 or done == total:
+                print(f"  {done}/{total}", flush=True)
+        return report
+    now = datetime.now(timezone.utc)
+    start = (now - timedelta(days=args.days)).replace(minute=0, second=0, microsecond=0)
+    warmup = timedelta(minutes=timeframe_minutes(settings.timeframe) * (max(c.candles_window for _, c in variants) + 5))
+    since_ms = int((start - warmup).timestamp() * 1000)
+    need = max(cfg.universe_size for _, cfg in variants)
+
+    if args.symbols:
+        symbols = [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
+    elif not dynamic:
+        symbols = data.top_symbols(quote=settings.quote_asset, limit=need, min_quote_volume=settings.min_quote_volume)
+    else:
+        # все пары к USDT, включая делистнутые: иначе в тест попадут только сегодняшние «выжившие»
+        candidates = sorted(
+            s for s, m in data.markets.items()
+            if m.get("spot") and m.get("quote") == settings.quote_asset and is_tradeable_base(str(m.get("base", "")))
+        )
+        print(f"Дневные свечи по {len(candidates)} парам к {settings.quote_asset} (включая делистнутые)...")
+        day_since = int((start - timedelta(days=2)).timestamp() * 1000)
+        daily, errors = fetch_many(
+            make_exchange, candidates, "1d", day_since, cache=cache, workers=args.workers, progress=progress(100)
+        )
+        daily = {s: f for s, f in daily.items() if not f.empty}
+        if errors:
+            log.debug("дневные свечи недоступны: %s", errors)
+        min_volume = min(cfg.min_quote_volume for _, cfg in variants)
+        symbols = select_pool(daily, start, top_n=need * args.pool_margin, min_quote_volume=min_volume)
+        delisted = [s for s in symbols if data.markets[s].get("active") is False]
+        print(f"Пул: {len(symbols)} пар хотя бы день были в топ-{need * args.pool_margin} по объёму"
+              + (f", из них сейчас делистнуты: {', '.join(delisted)}" if delisted else ""))
+
+    regime_daily = None
+    regime_emas = [cfg.regime_ema for _, cfg in variants if cfg.regime_filter]
+    if regime_emas:
+        regime_since = int((start - timedelta(days=max(regime_emas) * 2 + 10)).timestamp() * 1000)
+        try:
+            regime_daily = cache.history(data.exchange, settings.regime_symbol, "1d", regime_since)
+        except Exception as exc:  # noqa: BLE001
+            print(f"Дневные свечи {settings.regime_symbol} для фильтра рынка недоступны: {exc}", file=sys.stderr)
+            return 1
+
+    print(f"Загружаю свечи {settings.timeframe} за {args.days} дн. по {len(symbols)} парам...")
+    t0 = time.time()
+    frames, errors = fetch_many(
+        make_exchange, symbols, settings.timeframe, since_ms, cache=cache, workers=args.workers, progress=progress(50)
+    )
+    for symbol, error in errors.items():
+        print(f"  {symbol}: свечи недоступны ({error}), пропускаю")
+    print(f"Загружено за {time.time() - t0:.0f} с" + ("" if args.no_cache else f" (кэш: {cache.dir})"))
+    if dynamic:
+        print(f"Период: {start:%Y-%m-%d} — {now:%Y-%m-%d} UTC; список пар пересчитывается каждый час: "
+              f"топ по объёму за 24 часа на тот момент")
+    else:
+        print(f"Период: {start:%Y-%m-%d} — {now:%Y-%m-%d} UTC; пары по сегодняшнему объёму: {', '.join(frames)}")
+    print("Claude не участвует: каждый сигнал считается одобренным. Комиссия "
+          f"{base.fee_pct}% + проскальзывание {base.slippage_pct}% на каждую сторону.")
+    if base.kill_switch_reset_hours > 0:
+        print(f"Аварийная остановка снимается через {args.kill_reset_days:g} дн. (живой бот ждёт ручного reset-kill-switch).")
+    print()
+
+    results = []
+    for name, cfg in variants:
+        t0 = time.time()
+        result = run_backtest(frames, cfg, start, regime_daily=regime_daily)
+        results.append((name, result))
+        print(format_result(result, name))
+        log.debug("вариант %s посчитан за %.1f с", name, time.time() - t0)
+        print()
+    if len(results) > 1:
+        print(format_comparison(results))
+        print()
+    breakdown = monthly_breakdown(results[0][1])
+    if len(breakdown) > 1:
+        print(f"По месяцам ({results[0][0]}):")
+        print(format_breakdown(breakdown))
+        print()
+    bench = results[0][1].benchmark_pct
+    if bench is not None:
+        print(f"Для сравнения: BTC купить и держать за период {bench:+.2f}%")
+    if dynamic:
+        hours = results[0][1].universe_hours
+        total = max(len(results[0][1].equity), 1)
+        top = sorted(hours.items(), key=lambda x: -x[1])[:20]
+        print("Чаще всего в списке: " + ", ".join(f"{s.split('/')[0]} {h / total:.0%}" for s, h in top))
+    else:
+        print("Пары выбраны по сегодняшнему объёму, поэтому результат оптимистичен: "
+              "в этот список чаще попадают монеты, которые уже выросли.")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="python -m trader", description="Binance spot бот с Claude")
-    parser.add_argument("command", choices=["check", "once", "run", "status", "report", "close-all", "reset-kill-switch", "reset"])
+    parser.add_argument(
+        "command", choices=["check", "once", "run", "status", "report", "close-all", "reset-kill-switch", "reset", "backtest"]
+    )
     parser.add_argument("--env", default=".env", help="путь к .env (по умолчанию ./.env)")
     parser.add_argument("--yes", action="store_true", help="подтверждение для reset")
+    parser.add_argument("--days", type=int, default=90, help="backtest: дней истории (по умолчанию 90)")
+    parser.add_argument("--symbols", default="", help="backtest: свои пары через запятую вместо топа по объёму")
+    parser.add_argument(
+        "--variant", action="append", help='backtest: "имя:KEY=VALUE,KEY=VALUE" — сравнить с другими настройками'
+    )
+    parser.add_argument(
+        "--universe", choices=["dynamic", "today"], default="dynamic",
+        help="backtest: dynamic — топ по объёму на каждый час истории (по умолчанию); today — по сегодняшнему объёму",
+    )
+    parser.add_argument("--pool-margin", type=int, default=2, help=argparse.SUPPRESS)
+    parser.add_argument(
+        "--kill-reset-days", type=float, default=3.0,
+        help="backtest: через сколько дней снимать аварийную остановку (0 = никогда, как у живого бота)",
+    )
+    parser.add_argument("--workers", type=int, default=6, help="backtest: потоков загрузки (по умолчанию 6)")
+    parser.add_argument("--no-cache", action="store_true", help="backtest: не сохранять свечи в data/candles")
     args = parser.parse_args(argv)
 
     try:
-        settings = Settings.from_env(args.env)
+        # бэктесту ключи биржи не нужны: проверку настроек режима пропускаем
+        settings = Settings.from_env(args.env, validate=args.command != "backtest")
     except ConfigError as exc:
         print(exc, file=sys.stderr)
         return 2
+    if args.command == "backtest":
+        logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(name)s: %(message)s")
+        return cmd_backtest(settings, args)
     setup_logging(settings)
 
     if args.command == "reset":
@@ -151,6 +317,8 @@ def main(argv: list[str] | None = None) -> int:
         print(engine.status())
         print(f"\nУниверс: {', '.join(summary.universe)}")
         print(f"Сигналы: {', '.join(summary.signals) or 'нет'}")
+        if summary.regime:
+            print(f"Фильтр рынка: {summary.regime}")
         print(f"Куплено: {', '.join(summary.opened) or 'нет'}; продано: {', '.join(summary.closed) or 'нет'}")
         for line in summary.rejected:
             print(f"Отклонено: {line}")

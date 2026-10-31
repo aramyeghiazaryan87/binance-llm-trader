@@ -6,6 +6,7 @@ Binance spot бот: стратегия трендового пробоя (`trad
 - Тесты (офлайн, без ключей): `python -m pytest -q`
 - Проверка подключений: `python -m trader check`
 - Один цикл: `python -m trader once`; постоянно: `python -m trader run`
+- Бэктест (без LLM и ключей): `MARKET_DATA_URL=https://data-api.binance.vision python -m trader backtest --days 90 [--variant "имя:KEY=VAL,..."]`
 - Зависимости: `python3 -m venv .venv && .venv/bin/pip install -r requirements-dev.txt`
 
 ## Облачная сессия Claude Code
@@ -19,5 +20,6 @@ Binance spot бот: стратегия трендового пробоя (`trad
 
 ## Правила проекта
 - LLM только советует: открытие сделки без сигнала стратегии, рост размера сверх лимитов и отмена стопов невозможны по коду (`risk.py`, `sanitize_assessment`).
+- Фильтр рынка `REGIME_FILTER` включён по умолчанию: новые входы только когда BTC выше дневной EMA200 (`regime_ok` в `strategy.py`, проверка в `engine.py` до вызова LLM). Решение принято по годовому бэктесту: без фильтра −13.5%, с ним 0% и просадка 19% вместо 30%.
 - Модель по умолчанию `claude-sonnet-5-5` (выбор пользователя), effort `low`, лимит $10/мес (`budget.py`).
 - Новые функции сопровождать тестами в `tests/`; сеть в тестах не использовать.
