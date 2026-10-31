@@ -239,11 +239,23 @@ git pull && docker compose up -d --build
 
 ---
 
+## Можно ли запустить в облачной сессии Claude Code?
+
+Только для теста и только в режиме `paper`. Binance отвечает `451 restricted location` на IP облачных серверов Claude, **в том числе testnet**, поэтому ордера на testnet оттуда не проходят. Для теста логики, Claude, новостей и Telegram на реальных ценах:
+
+1. В настройках среды (Network access → Allowed domains) добавьте `data-api.binance.vision`. Это официальный эндпоинт Binance только для публичных рыночных данных.
+2. В новой сессии выполните:
+   ```bash
+   TRADING_MODE=paper MARKET_DATA_URL=https://data-api.binance.vision python -m trader once
+   ```
+
+Настоящую торговлю на testnet запускайте на своём компьютере или на VPS в стране, где Binance работает.
+
 ## Частые проблемы
 
 | Симптом | Причина и решение |
 |---|---|
-| `451` / `restricted location` | Binance недоступен из страны сервера: смените регион VPS |
+| `451` / `restricted location` | Binance недоступен из страны сервера (так же и из облака Claude): запускайте на компьютере или VPS в другой стране |
 | `Timestamp for this request is outside of the recvWindow` | Отстают часы сервера: `sudo timedatectl set-ntp true` |
 | `Invalid API-key, IP, or permissions` | Ключ не от того режима (testnet ≠ live), нет права Spot Trading или IP не в белом списке |
 | `LLM: disabled` | Не задан `ANTHROPIC_API_KEY` или `LLM_ENABLED=false` |

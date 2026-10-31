@@ -74,7 +74,7 @@ def build_advisor(settings: Settings, storage: Storage) -> LLMAdvisor | None:
 def build_engine(settings: Settings) -> TradingEngine:
     storage = Storage(settings.db_path)
     if settings.market_data_source == "mainnet":
-        data = MarketData(make_binance(), name="mainnet")
+        data = MarketData(make_binance(public_url=settings.market_data_url), name="mainnet")
     else:
         data = MarketData(
             make_binance(sandbox=settings.mode == "testnet", demo=settings.mode == "demo"),

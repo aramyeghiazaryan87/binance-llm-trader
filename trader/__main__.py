@@ -36,7 +36,8 @@ def cmd_check(engine) -> int:
         print(f"  OK: {engine.data.name}, спотовых пар: {len(engine.data.symbols())}")
     except Exception as exc:  # noqa: BLE001
         print(f"  ОШИБКА: {exc}")
-        print("  Подсказка: HTTP 451 = Binance недоступен из этой страны/дата-центра (например, США).")
+        print("  Подсказка: HTTP 451 / restricted location = Binance не обслуживает страну, где стоит этот компьютер")
+        print("  или сервер (например, США). Запускайте бота на компьютере или VPS в разрешённой стране.")
         return 1
 
     print("\n[2] Биржа исполнения")

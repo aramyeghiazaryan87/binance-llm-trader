@@ -30,8 +30,13 @@ def make_binance(
     secret: str = "",
     sandbox: bool = False,
     demo: bool = False,
+    public_url: str = "",
 ) -> ccxt.binance:
-    """Создаёт клиент ccxt для спота Binance (без ключей — только публичные данные)."""
+    """Создаёт клиент ccxt для спота Binance (без ключей — только публичные данные).
+
+    public_url — другой адрес для публичных данных, например https://data-api.binance.vision
+    (официальный эндпоинт Binance только для рыночных данных).
+    """
     exchange = ccxt.binance(
         {
             "apiKey": api_key or None,
@@ -51,6 +56,10 @@ def make_binance(
         exchange.set_sandbox_mode(True)
     if demo:
         exchange.enable_demo_trading(True)
+    if public_url:
+        api = dict(exchange.urls["api"])
+        api["public"] = public_url.rstrip("/") + "/api/v3"
+        exchange.urls = {**exchange.urls, "api": api}
     return exchange
 
 

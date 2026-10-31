@@ -140,3 +140,13 @@ def test_select_universe_filters():
     assert result == ["BTC/USDT", "ETH/USDT", "SOL/USDT"]
     result = select_universe(tickers, markets, quote="USDT", limit=10, min_quote_volume=1e6, allowed={"SOL/USDT", "ETH/USDT"})
     assert result == ["ETH/USDT", "SOL/USDT"]
+
+
+def test_public_market_data_url_override():
+    from trader.market_data import make_binance
+
+    data = make_binance(public_url="https://data-api.binance.vision/")
+    plain = make_binance()
+    assert data.urls["api"]["public"] == "https://data-api.binance.vision/api/v3"
+    assert data.urls["api"]["private"] == "https://api.binance.com/api/v3"  # ордера не трогаем
+    assert plain.urls["api"]["public"] == "https://api.binance.com/api/v3"  # другие клиенты не затронуты

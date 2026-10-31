@@ -78,6 +78,7 @@ class Settings:
     min_quote_volume: float = 20_000_000.0
     max_watchlist: int = 5
     market_data_source: str = "mainnet"  # mainnet | exchange
+    market_data_url: str = ""  # например https://data-api.binance.vision (только публичные данные)
     max_price_deviation_pct: float = 3.0
 
     # --- бюджет и риск ---
@@ -160,6 +161,7 @@ class Settings:
             min_quote_volume=_float("MIN_QUOTE_VOLUME", 20_000_000.0),
             max_watchlist=_int("MAX_WATCHLIST", 5),
             market_data_source=_str("MARKET_DATA_SOURCE", "mainnet").lower(),
+            market_data_url=_str("MARKET_DATA_URL", ""),
             max_price_deviation_pct=_float("MAX_PRICE_DEVIATION_PCT", 3.0),
             budget_usdt=_float("BUDGET_USDT", 0.0),
             paper_start_usdt=_float("PAPER_START_USDT", 10_000.0),
@@ -224,6 +226,8 @@ class Settings:
             p.append(f"для режима {self.mode} нужны ключи {names}")
         if self.market_data_source not in ("mainnet", "exchange"):
             p.append("MARKET_DATA_SOURCE должен быть mainnet или exchange")
+        if self.market_data_url and not self.market_data_url.startswith("https://"):
+            p.append("MARKET_DATA_URL должен начинаться с https://")
         if self.mode == "paper" and self.market_data_source != "mainnet":
             p.append("в режиме paper данные берутся только с mainnet (MARKET_DATA_SOURCE=mainnet)")
         if self.llm_effort not in ("low", "medium", "high", "xhigh", "max"):
