@@ -19,9 +19,9 @@ from .conftest import HOUR_MS, make_candles
 NOW_MS = 1_800_000_000_000 // HOUR_MS * HOUR_MS
 
 
-def frame_with_tail(tail: list[tuple[float, float, float, float]], n: int = 400):
+def frame_with_tail(tail: list[tuple[float, float, float, float]], n: int = 400, now_ms: int = NOW_MS):
     """Плавный рост, на последней свече пробой с объёмом (сигнал), затем свечи tail (open, high, low, close)."""
-    rows = make_candles(n, breakout=True, now_ms=NOW_MS)[:-1]  # без незакрытой свечи
+    rows = make_candles(n, breakout=True, now_ms=now_ms)[:-1]  # без незакрытой свечи
     ts = rows[-1][0]
     for o, h, low, c in tail:
         ts += HOUR_MS
@@ -169,3 +169,106 @@ def test_select_pool_keeps_past_leaders():
 
 def test_bool_override():
     assert BacktestConfig().with_overrides({"DYNAMIC_UNIVERSE": "true"}).dynamic_universe is True
+
+
+def crash_then_recovery_frame():
+    """Сигнал, затем обвал (стоп), затем долгое боковое движение и новый пробой."""
+    frame, sig_time = frame_with_tail([])
+    p = float(frame.loc[sig_time, "close"])
+    low = p * 0.5
+    tail = [(low, low, low * 0.99, low)] + [(low, low * 1.001, low * 0.999, low)] * 30
+    return frame_with_tail(tail)
+
+
+def test_kill_switch_stops_trading_or_resets_after_pause():
+    frame, sig_time = crash_then_recovery_frame()
+    big_risk = replace(BacktestConfig().limits, risk_per_trade_pct=5.0, max_position_pct=100.0, max_drawdown_pct=10.0)
+    cfg = BacktestConfig(limits=big_risk)
+    result = run_backtest({"SOL/USDT": frame}, cfg, start_before(frame, sig_time))
+    # гэп на 50% вниз: стоп по цене открытия, просадка > 10% -> аварийная остановка
+    assert result.trades[0].reason == "stop_loss"
+    assert len(result.kill_switch_times) == 1 and result.kill_switch_time == result.trades[0].exit_time
+
+    # у второй пары сигнал через 20 часов после обвала первой
+    later, later_sig = frame_with_tail([], now_ms=NOW_MS + 20 * HOUR_MS)
+    p = float(later.loc[later_sig, "close"])
+    later, later_sig = frame_with_tail([(p, p * 1.001, p * 0.999, p)] * 3, now_ms=NOW_MS + 20 * HOUR_MS)
+    frames = {"SOL/USDT": frame, "ETH/USDT": later}
+    start = start_before(frame, sig_time)
+
+    stopped = run_backtest(frames, cfg, start)  # как живой бот: после остановки сделок нет
+    assert [t.symbol for t in stopped.trades] == ["SOL/USDT"]
+    assert stopped.skipped == {"аварийная остановка": 1}
+
+    reset = run_backtest(frames, replace(cfg, kill_switch_reset_hours=6), start)  # пауза 6 ч, потом снова торгуем
+    assert [t.symbol for t in reset.trades] == ["SOL/USDT", "ETH/USDT"]
+    assert reset.trades[1].entry_time == later_sig + timedelta(hours=1)
+    assert len(reset.kill_switch_times) == 1  # пик капитала сброшен: старая просадка не вызывает новую остановку
+
+
+def test_monthly_breakdown_sums_to_total():
+    from trader.backtest import format_breakdown, monthly_breakdown
+
+    frame, sig_time = frame_with_tail([])
+    start = sig_time - timedelta(days=40)
+    result = run_backtest({"BTC/USDT": frame}, BacktestConfig(), start)
+    rows = monthly_breakdown(result)
+    assert len(rows) >= 2
+    total = 1.0
+    for row in rows:
+        total *= 1 + row.return_pct / 100
+    assert (total - 1) * 100 == pytest.approx(result.return_pct, abs=1e-6)
+    assert sum(r.trades for r in rows) == len(result.trades)
+    assert all(r.btc_pct is not None for r in rows)
+    assert rows[0].label in format_breakdown(rows)
+
+
+def test_candle_cache_fetches_only_new_tail(tmp_path):
+    from trader.backtest import CandleCache, fetch_many
+
+    rows = make_candles(1500, now_ms=NOW_MS)
+    calls = []
+
+    class Paged:
+        def fetch_ohlcv(self, symbol, timeframe, since, limit):
+            calls.append(since)
+            return [r for r in rows if r[0] >= since][:limit]
+
+    cache = CandleCache(tmp_path / "candles")
+    first_now = rows[1200][0]
+    first = cache.history(Paged(), "SOL/USDT", "1h", rows[0][0], now_ms=first_now)
+    assert len(first) == 1200 and len(calls) == 2
+
+    calls.clear()
+    frames, errors = fetch_many(lambda: Paged(), ["SOL/USDT"], "1h", rows[100][0], cache=cache, now_ms=NOW_MS)
+    assert errors == {}
+    assert calls == [rows[1200][0]]  # докачан только хвост
+    assert len(frames["SOL/USDT"]) == 1500 - 100
+    assert frames["SOL/USDT"].index.is_unique and frames["SOL/USDT"].index.is_monotonic_increasing
+
+
+def test_fetch_many_reports_errors_and_retries(monkeypatch):
+    import ccxt
+
+    from trader import backtest
+
+    monkeypatch.setattr(backtest.time, "sleep", lambda _s: None)
+    rows = make_candles(50, now_ms=NOW_MS)
+    attempts = {"FLAKY/USDT": 0}
+
+    class Exchange:
+        def fetch_ohlcv(self, symbol, timeframe, since, limit):
+            if symbol == "BAD/USDT":
+                raise ccxt.BadSymbol("нет такой пары")
+            if symbol == "FLAKY/USDT" and attempts[symbol] < 2:
+                attempts[symbol] += 1
+                raise ccxt.NetworkError("timeout")
+            return [r for r in rows if r[0] >= since][:limit]
+
+    seen = []
+    frames, errors = backtest.fetch_many(
+        Exchange, ["FLAKY/USDT", "BAD/USDT"], "1h", rows[0][0], workers=2, progress=lambda d, t: seen.append(d), now_ms=NOW_MS
+    )
+    assert list(frames) == ["FLAKY/USDT"] and len(frames["FLAKY/USDT"]) == 50
+    assert "нет такой пары" in errors["BAD/USDT"]
+    assert sorted(seen) == [1, 2]

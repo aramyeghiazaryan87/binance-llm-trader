@@ -12,6 +12,7 @@
         --days 90                       сколько дней истории
         --variant "имя:UNIVERSE_SIZE=25,MIN_VOLUME_RATIO=1.0"   сравнить с другими настройками
         --universe today                пары по сегодняшнему объёму (быстрее, но оптимистично)
+        --kill-reset-days 3             снимать аварийную остановку через 3 дня (0 = никогда)
 """
 from __future__ import annotations
 
@@ -123,9 +124,12 @@ def cmd_backtest(settings: Settings, args: argparse.Namespace) -> int:
 
     from .backtest import (
         BacktestConfig,
-        fetch_history,
+        CandleCache,
+        fetch_many,
+        format_breakdown,
         format_comparison,
         format_result,
+        monthly_breakdown,
         parse_variant,
         run_backtest,
         select_pool,
@@ -134,7 +138,11 @@ def cmd_backtest(settings: Settings, args: argparse.Namespace) -> int:
     from .strategy import timeframe_minutes
 
     dynamic = args.universe == "dynamic"
-    base = replace(BacktestConfig.from_settings(settings), dynamic_universe=dynamic)
+    base = replace(
+        BacktestConfig.from_settings(settings),
+        dynamic_universe=dynamic,
+        kill_switch_reset_hours=max(args.kill_reset_days, 0.0) * 24.0,
+    )
     try:
         variants = [("текущие настройки", base)]
         for spec in args.variant or []:
@@ -147,7 +155,17 @@ def cmd_backtest(settings: Settings, args: argparse.Namespace) -> int:
         print("--days должно быть больше 0", file=sys.stderr)
         return 2
 
-    data = MarketData(make_binance(public_url=settings.market_data_url), name="mainnet")
+    def make_exchange():
+        return make_binance(public_url=settings.market_data_url)
+
+    data = MarketData(make_exchange(), name="mainnet")
+    cache = CandleCache(None if args.no_cache else settings.data_dir / "candles")
+
+    def progress(every: int):
+        def report(done: int, total: int) -> None:
+            if done % every == 0 or done == total:
+                print(f"  {done}/{total}", flush=True)
+        return report
     now = datetime.now(timezone.utc)
     start = (now - timedelta(days=args.days)).replace(minute=0, second=0, microsecond=0)
     warmup = timedelta(minutes=timeframe_minutes(settings.timeframe) * (max(c.candles_window for _, c in variants) + 5))
@@ -166,17 +184,12 @@ def cmd_backtest(settings: Settings, args: argparse.Namespace) -> int:
         )
         print(f"Дневные свечи по {len(candidates)} парам к {settings.quote_asset} (включая делистнутые)...")
         day_since = int((start - timedelta(days=2)).timestamp() * 1000)
-        daily = {}
-        for n, symbol in enumerate(candidates, 1):
-            try:
-                frame = fetch_history(data.exchange, symbol, "1d", day_since)
-            except Exception as exc:  # noqa: BLE001
-                log.debug("%s: дневные свечи недоступны: %s", symbol, exc)
-                continue
-            if not frame.empty:
-                daily[symbol] = frame
-            if n % 100 == 0:
-                print(f"  {n}/{len(candidates)}", flush=True)
+        daily, errors = fetch_many(
+            make_exchange, candidates, "1d", day_since, cache=cache, workers=args.workers, progress=progress(100)
+        )
+        daily = {s: f for s, f in daily.items() if not f.empty}
+        if errors:
+            log.debug("дневные свечи недоступны: %s", errors)
         min_volume = min(cfg.min_quote_volume for _, cfg in variants)
         symbols = select_pool(daily, start, top_n=need * args.pool_margin, min_quote_volume=min_volume)
         delisted = [s for s in symbols if data.markets[s].get("active") is False]
@@ -184,21 +197,23 @@ def cmd_backtest(settings: Settings, args: argparse.Namespace) -> int:
               + (f", из них сейчас делистнуты: {', '.join(delisted)}" if delisted else ""))
 
     print(f"Загружаю свечи {settings.timeframe} за {args.days} дн. по {len(symbols)} парам...")
-    frames = {}
-    for n, symbol in enumerate(symbols, 1):
-        try:
-            frames[symbol] = fetch_history(data.exchange, symbol, settings.timeframe, since_ms)
-        except Exception as exc:  # noqa: BLE001
-            print(f"  {symbol}: свечи недоступны ({exc}), пропускаю")
-        if n % 20 == 0:
-            print(f"  {n}/{len(symbols)}", flush=True)
+    t0 = time.time()
+    frames, errors = fetch_many(
+        make_exchange, symbols, settings.timeframe, since_ms, cache=cache, workers=args.workers, progress=progress(50)
+    )
+    for symbol, error in errors.items():
+        print(f"  {symbol}: свечи недоступны ({error}), пропускаю")
+    print(f"Загружено за {time.time() - t0:.0f} с" + ("" if args.no_cache else f" (кэш: {cache.dir})"))
     if dynamic:
         print(f"Период: {start:%Y-%m-%d} — {now:%Y-%m-%d} UTC; список пар пересчитывается каждый час: "
               f"топ по объёму за 24 часа на тот момент")
     else:
         print(f"Период: {start:%Y-%m-%d} — {now:%Y-%m-%d} UTC; пары по сегодняшнему объёму: {', '.join(frames)}")
     print("Claude не участвует: каждый сигнал считается одобренным. Комиссия "
-          f"{base.fee_pct}% + проскальзывание {base.slippage_pct}% на каждую сторону.\n")
+          f"{base.fee_pct}% + проскальзывание {base.slippage_pct}% на каждую сторону.")
+    if base.kill_switch_reset_hours > 0:
+        print(f"Аварийная остановка снимается через {args.kill_reset_days:g} дн. (живой бот ждёт ручного reset-kill-switch).")
+    print()
 
     results = []
     for name, cfg in variants:
@@ -210,6 +225,11 @@ def cmd_backtest(settings: Settings, args: argparse.Namespace) -> int:
         print()
     if len(results) > 1:
         print(format_comparison(results))
+        print()
+    breakdown = monthly_breakdown(results[0][1])
+    if len(breakdown) > 1:
+        print(f"По месяцам ({results[0][0]}):")
+        print(format_breakdown(breakdown))
         print()
     bench = results[0][1].benchmark_pct
     if bench is not None:
@@ -242,6 +262,12 @@ def main(argv: list[str] | None = None) -> int:
         help="backtest: dynamic — топ по объёму на каждый час истории (по умолчанию); today — по сегодняшнему объёму",
     )
     parser.add_argument("--pool-margin", type=int, default=2, help=argparse.SUPPRESS)
+    parser.add_argument(
+        "--kill-reset-days", type=float, default=3.0,
+        help="backtest: через сколько дней снимать аварийную остановку (0 = никогда, как у живого бота)",
+    )
+    parser.add_argument("--workers", type=int, default=6, help="backtest: потоков загрузки (по умолчанию 6)")
+    parser.add_argument("--no-cache", action="store_true", help="backtest: не сохранять свечи в data/candles")
     args = parser.parse_args(argv)
 
     try:

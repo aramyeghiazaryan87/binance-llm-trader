@@ -25,11 +25,16 @@ from __future__ import annotations
 
 import logging
 import math
+import threading
 import time
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, fields, replace
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any
 
+import ccxt
 import pandas as pd
 
 from .indicators import rolling_high, sma
@@ -63,6 +68,9 @@ class BacktestConfig:
     timeframe: str = "1h"
     min_quote_volume: float = 20_000_000.0
     dynamic_universe: bool = False  # False: пары в порядке frames, первые universe_size
+    # 0 = как у живого бота: после аварийной остановки сделок больше нет (снимается только вручную).
+    # >0 = остановка снимается через столько часов, пик капитала сбрасывается (как reset-kill-switch).
+    kill_switch_reset_hours: float = 0.0
 
     @classmethod
     def from_settings(cls, s: Any) -> "BacktestConfig":
@@ -182,9 +190,14 @@ class BacktestResult:
     equity: list[tuple[datetime, float]] = field(default_factory=list)
     signals: int = 0
     skipped: dict[str, int] = field(default_factory=dict)
-    kill_switch_time: datetime | None = None
+    kill_switch_times: list[datetime] = field(default_factory=list)
     benchmark_pct: float | None = None  # BTC buy & hold за тот же период
+    benchmark_closes: pd.Series | None = None  # закрытия BTC за период, для помесячной разбивки
     universe_hours: dict[str, int] = field(default_factory=dict)  # сколько часов пара была в списке
+
+    @property
+    def kill_switch_time(self) -> datetime | None:
+        return self.kill_switch_times[0] if self.kill_switch_times else None
 
     @property
     def pnl_by_symbol(self) -> dict[str, tuple[int, float]]:
@@ -285,6 +298,7 @@ def run_backtest(
     peak = cfg.start_usdt
     day, day_start_equity, daily_blocked = None, cfg.start_usdt, False
     kill = False
+    kill_until: datetime | None = None
 
     def close_trade(trade: Trade, price: float, when: datetime, reason: str) -> None:
         nonlocal cash
@@ -304,6 +318,8 @@ def run_backtest(
 
     for ts in times:
         bar_close = ts + tf
+        if kill and kill_until is not None and bar_close >= kill_until:
+            kill, kill_until, peak = False, None, cash  # позиций нет: капитал = cash
         # 1. стопы открытых позиций по свече ts
         for symbol in list(open_trades):
             i = positions_idx[symbol].get(ts)
@@ -346,7 +362,9 @@ def run_backtest(
             daily_blocked = True
         if not kill and risk.drawdown_hit(drawdown):
             kill = True
-            result.kill_switch_time = bar_close
+            result.kill_switch_times.append(bar_close)
+            if cfg.kill_switch_reset_hours > 0:
+                kill_until = bar_close + timedelta(hours=cfg.kill_switch_reset_hours)
             for symbol in list(open_trades):
                 close_trade(open_trades[symbol], last_close[symbol], bar_close, "kill_switch")
             equity = cash
@@ -411,7 +429,63 @@ def run_backtest(
         period = frames[btc][(frames[btc].index >= start) & (frames[btc].index < end_time)]
         if not period.empty and period["open"].iloc[0] > 0:
             result.benchmark_pct = (float(period["close"].iloc[-1]) / float(period["open"].iloc[0]) - 1.0) * 100.0
+            closes_btc = period["close"].copy()
+            closes_btc.index = closes_btc.index + tf
+            result.benchmark_closes = closes_btc
     return result
+
+
+@dataclass(frozen=True)
+class PeriodStats:
+    label: str
+    return_pct: float
+    trades: int
+    win_rate: float
+    btc_pct: float | None
+    kill_switch: bool
+
+
+def monthly_breakdown(result: BacktestResult) -> list[PeriodStats]:
+    """Доход по календарным месяцам (UTC) по кривой капитала; сделки относятся к месяцу закрытия."""
+    if not result.equity:
+        return []
+    equity = pd.Series([v for _, v in result.equity], index=pd.DatetimeIndex([t for t, _ in result.equity]))
+    out: list[PeriodStats] = []
+    prev_end = result.config.start_usdt
+    months = equity.index.tz_convert("UTC").tz_localize(None).to_period("M")
+    for period, values in equity.groupby(months):
+        start_value, end_value = prev_end, float(values.iloc[-1])
+        prev_end = end_value
+        first, last = values.index[0], values.index[-1]
+        trades = [t for t in result.trades if t.exit_time and first <= t.exit_time <= last]
+        btc = None
+        if result.benchmark_closes is not None:
+            before = result.benchmark_closes[result.benchmark_closes.index < first]
+            inside = result.benchmark_closes[(result.benchmark_closes.index >= first) & (result.benchmark_closes.index <= last)]
+            base = before.iloc[-1] if not before.empty else (inside.iloc[0] if not inside.empty else None)
+            if base and not inside.empty:
+                btc = (float(inside.iloc[-1]) / float(base) - 1.0) * 100.0
+        out.append(
+            PeriodStats(
+                label=str(period),
+                return_pct=(end_value / start_value - 1.0) * 100.0 if start_value > 0 else 0.0,
+                trades=len(trades),
+                win_rate=sum(t.pnl > 0 for t in trades) / len(trades) * 100.0 if trades else 0.0,
+                btc_pct=btc,
+                kill_switch=any(first <= k <= last for k in result.kill_switch_times),
+            )
+        )
+    return out
+
+
+def format_breakdown(rows: list[PeriodStats]) -> str:
+    header = f"{'месяц':<8} {'доход%':>7} {'сделок':>6} {'приб.%':>6} {'BTC%':>7}"
+    lines = [header, "-" * len(header)]
+    for r in rows:
+        btc = f"{r.btc_pct:>+7.1f}" if r.btc_pct is not None else f"{'—':>7}"
+        mark = "  ⛔ аварийная остановка" if r.kill_switch else ""
+        lines.append(f"{r.label:<8} {r.return_pct:>+7.2f} {r.trades:>6} {r.win_rate:>6.0f} {btc}{mark}")
+    return "\n".join(lines)
 
 
 def _volume_ranking(frames: dict[str, pd.DataFrame], symbols: list[str], times: list[datetime], cfg: BacktestConfig):
@@ -457,6 +531,20 @@ def select_pool(daily: dict[str, pd.DataFrame], start: datetime, top_n: int, min
     return sorted(chosen, key=lambda s: -totals[s])
 
 
+def _with_retries(call: Callable[[], Any], attempts: int = 4, base_delay: float = 2.0) -> Any:
+    """Повтор при сетевых сбоях и лимите запросов (2, 4, 8 с). Ошибки вроде «нет такой пары» не повторяем."""
+    for attempt in range(attempts):
+        try:
+            return call()
+        except (ccxt.NetworkError, ccxt.RateLimitExceeded) as exc:
+            if attempt == attempts - 1:
+                raise
+            delay = base_delay * 2**attempt
+            log.debug("сбой запроса (%s), повтор через %.0f с", exc, delay)
+            time.sleep(delay)
+    return None
+
+
 def fetch_history(exchange: Any, symbol: str, timeframe: str, since_ms: int, now_ms: int | None = None) -> pd.DataFrame:
     """Все закрытые свечи с since_ms до текущего момента, постранично по 1000 штук."""
     now_ms = int(time.time() * 1000) if now_ms is None else now_ms
@@ -464,7 +552,7 @@ def fetch_history(exchange: Any, symbol: str, timeframe: str, since_ms: int, now
     rows: list[list[float]] = []
     cursor = since_ms
     while cursor < now_ms:
-        batch = exchange.fetch_ohlcv(symbol, timeframe=timeframe, since=cursor, limit=1000)
+        batch = _with_retries(lambda: exchange.fetch_ohlcv(symbol, timeframe=timeframe, since=cursor, limit=1000))
         if not batch:
             break
         rows.extend(batch)
@@ -492,8 +580,9 @@ def format_result(result: BacktestResult, title: str = "") -> str:
         lines.append(f"Среднее удержание: {avg_hold:.0f} ч; выходы: {reasons}")
     if r.skipped:
         lines.append("Пропущено сигналов: " + ", ".join(f"{k} {v}" for k, v in r.skipped.items()))
-    if r.kill_switch_time:
-        lines.append(f"⛔ Аварийная остановка по просадке: {r.kill_switch_time:%Y-%m-%d %H:%M} UTC")
+    if r.kill_switch_times:
+        when = ", ".join(f"{t:%Y-%m-%d}" for t in r.kill_switch_times)
+        lines.append(f"⛔ Аварийная остановка по просадке: {len(r.kill_switch_times)} раз ({when})")
     if r.trades:
         ranked = sorted(r.pnl_by_symbol.items(), key=lambda x: -x[1][1])
         fmt = lambda items: ", ".join(f"{s.split('/')[0]} {p:+,.0f}" for s, (_, p) in items)  # noqa: E731
@@ -512,3 +601,98 @@ def format_comparison(results: list[tuple[str, BacktestResult]]) -> str:
             f"{r.avg_trade_pct:>+7.2f} {pf:>5} {r.return_pct:>+7.2f} {r.max_drawdown_pct:>9.2f}"
         )
     return "\n".join(lines)
+
+
+class CandleCache:
+    """Свечи на диске (data/candles/<пара>_<таймфрейм>.csv.gz): следующие запуски докачивают только новое.
+
+    Папка data/ в .gitignore. В облачной сессии кэш живёт до конца сессии, на своём компьютере — постоянно.
+    """
+
+    def __init__(self, directory: Path | str | None):
+        self.dir = Path(directory) if directory else None
+        if self.dir:
+            self.dir.mkdir(parents=True, exist_ok=True)
+
+    def _path(self, symbol: str, timeframe: str) -> Path:
+        assert self.dir is not None
+        return self.dir / f"{symbol.replace('/', '_')}_{timeframe}.csv.gz"
+
+    def load(self, symbol: str, timeframe: str) -> pd.DataFrame | None:
+        if not self.dir:
+            return None
+        path = self._path(symbol, timeframe)
+        if not path.exists():
+            return None
+        try:
+            frame = pd.read_csv(path, index_col=0)
+        except Exception as exc:  # noqa: BLE001 — битый файл просто качаем заново
+            log.debug("кэш %s не читается: %s", path, exc)
+            return None
+        frame.index = pd.to_datetime(frame.index, utc=True)
+        frame.index.name = "ts"
+        return frame.astype(float)
+
+    def save(self, symbol: str, timeframe: str, frame: pd.DataFrame) -> None:
+        if self.dir:
+            frame.to_csv(self._path(symbol, timeframe))
+
+    def history(
+        self, exchange: Any, symbol: str, timeframe: str, since_ms: int, now_ms: int | None = None
+    ) -> pd.DataFrame:
+        """Свечи с since_ms: из кэша, докачивая только недостающий хвост (или всё, если кэш короче)."""
+        cached = self.load(symbol, timeframe)
+        since_ts = pd.Timestamp(since_ms, unit="ms", tz="UTC")
+        step = timeframe_minutes(timeframe) * 60_000
+        if cached is not None and not cached.empty and cached.index[0] <= since_ts:
+            tail_since = int(cached.index[-1].timestamp() * 1000) + step
+            fresh = fetch_history(exchange, symbol, timeframe, tail_since, now_ms)
+            frame = pd.concat([cached, fresh]) if not fresh.empty else cached
+            frame = frame[~frame.index.duplicated(keep="last")].sort_index()
+        else:
+            frame = fetch_history(exchange, symbol, timeframe, since_ms, now_ms)
+        if not frame.empty:
+            self.save(symbol, timeframe, frame)
+        return frame[frame.index >= since_ts]
+
+
+def fetch_many(
+    make_exchange: Callable[[], Any],
+    symbols: list[str],
+    timeframe: str,
+    since_ms: int,
+    *,
+    cache: CandleCache | None = None,
+    workers: int = 6,
+    progress: Callable[[int, int], None] | None = None,
+    now_ms: int | None = None,
+) -> tuple[dict[str, pd.DataFrame], dict[str, str]]:
+    """Свечи по многим парам в несколько потоков (у каждого потока свой клиент ccxt).
+
+    Возвращает (свечи в порядке symbols, ошибки по парам). 6 потоков укладываются в лимит
+    Binance на публичные запросы с запасом.
+    """
+    cache = cache or CandleCache(None)
+    local = threading.local()
+    lock = threading.Lock()
+    done = 0
+
+    def one(symbol: str) -> tuple[str, pd.DataFrame | None, str]:
+        nonlocal done
+        if not hasattr(local, "exchange"):
+            local.exchange = make_exchange()
+        try:
+            frame, error = cache.history(local.exchange, symbol, timeframe, since_ms, now_ms), ""
+        except Exception as exc:  # noqa: BLE001
+            frame, error = None, str(exc)
+        with lock:
+            done += 1
+            if progress:
+                progress(done, len(symbols))
+        return symbol, frame, error
+
+    with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
+        results = list(pool.map(one, symbols))
+    frames = {s: f for s, f, _ in results if f is not None}
+    errors = {s: e for s, _, e in results if e}
+    return frames, errors
