@@ -36,6 +36,10 @@ def make_binance(
 
     public_url — другой адрес для публичных данных, например https://data-api.binance.vision
     (официальный эндпоинт Binance только для рыночных данных).
+
+    requests_trust_env: ccxt по умолчанию игнорирует окружение, а нам нужны стандартные
+    HTTPS_PROXY и REQUESTS_CA_BUNDLE (корпоративный прокси, облачная сессия Claude Code).
+    Проверка TLS при этом остаётся включённой.
     """
     exchange = ccxt.binance(
         {
@@ -43,6 +47,7 @@ def make_binance(
             "secret": secret or None,
             "enableRateLimit": True,
             "timeout": 20_000,
+            "requests_trust_env": True,
             "options": {
                 "defaultType": "spot",
                 "fetchMarkets": {"types": ["spot"]},
