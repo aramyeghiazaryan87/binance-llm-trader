@@ -1,0 +1,8 @@
+anthropic>=2.3,<3
+ccxt>=4.5,<5
+pandas>=2.2
+numpy>=1.26
+feedparser>=6.0
+pydantic>=2.7,<3
+python-dotenv>=1.0
+requests>=2.31

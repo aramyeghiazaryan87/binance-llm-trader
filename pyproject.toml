@@ -1,0 +1,9 @@
+[project]
+name = "binance-llm-trader"
+version = "0.1.0"
+description = "Binance spot trading agent: rule-based breakout strategy + Claude as signal filter, news analyst and reporter"
+requires-python = ">=3.11"
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]

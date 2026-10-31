@@ -1,0 +1,14 @@
+# секреты и локальные данные — никогда не коммитить
+.env
+data/
+*.db
+*.log
+
+# python
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+build/
+dist/

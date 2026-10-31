@@ -1,0 +1,174 @@
+"""Командная строка.
+
+    python -m trader check              проверить подключения и настройки (ордера не ставятся)
+    python -m trader once               один торговый цикл и выход
+    python -m trader run                работать постоянно
+    python -m trader status             капитал, позиции, расходы на LLM
+    python -m trader report             отправить дневной отчёт сейчас
+    python -m trader close-all          продать все позиции бота
+    python -m trader reset-kill-switch  снять аварийную остановку
+    python -m trader reset --yes        удалить базу состояния (только без открытых позиций)
+"""
+from __future__ import annotations
+
+import argparse
+import logging
+import sys
+
+from .app import build_engine, setup_logging
+from .budget import estimate_input_tokens, month_bounds, tokens_cost
+from .config import ConfigError, Settings
+from .llm import DecisionContext, PositionView, build_user_prompt
+from .strategy import entry_signal
+
+log = logging.getLogger("trader")
+
+
+def cmd_check(engine) -> int:
+    s = engine.s
+    ok = True
+    print(f"Режим: {s.mode} | данные: {s.market_data_source} | модель: {s.llm_model if s.llm_enabled else 'LLM выключен'}")
+    print(f"Бюджет LLM: ${s.llm_monthly_budget_usd:.2f}/мес, effort={s.llm_effort}, max_tokens={s.llm_max_tokens}")
+
+    print("\n[1] Рыночные данные")
+    try:
+        engine.data.load_markets()
+        print(f"  OK: {engine.data.name}, спотовых пар: {len(engine.data.symbols())}")
+    except Exception as exc:  # noqa: BLE001
+        print(f"  ОШИБКА: {exc}")
+        print("  Подсказка: HTTP 451 = Binance недоступен из этой страны/дата-центра (например, США).")
+        return 1
+
+    print("\n[2] Биржа исполнения")
+    try:
+        engine.broker.load_markets()
+        allowed = engine.broker.symbols()
+        free = engine.broker.free_balance(s.quote_asset)
+        print(f"  OK: {s.mode}, пар к {s.quote_asset}: {len(allowed)}, свободно {free:,.2f} {s.quote_asset}")
+    except Exception as exc:  # noqa: BLE001
+        ok = False
+        allowed = None
+        print(f"  ОШИБКА: {exc}")
+        print("  Проверьте ключи API, права (Enable Spot Trading) и привязку к IP.")
+
+    print("\n[3] Универс пар")
+    universe = engine.data.top_symbols(
+        quote=s.quote_asset, limit=s.universe_size, min_quote_volume=s.min_quote_volume, allowed=allowed
+    )
+    print(f"  {len(universe)}: {', '.join(universe) or '—'}")
+    features = engine._collect_features(universe)
+    signals = [sig for f in features.values() if (sig := entry_signal(f, engine.params))]
+    print(f"  свечи получены: {len(features)}, сигналов на вход прямо сейчас: {len(signals)}")
+    for sig in signals:
+        print(f"   • {sig.symbol}: {sig.reason}")
+
+    print("\n[4] Новости")
+    headlines = engine.news.headlines()
+    fear_greed = engine.news.fear_greed()
+    print(f"  заголовков: {len(headlines)}; индекс страха и жадности: "
+          f"{f'{fear_greed.value} ({fear_greed.label})' if fear_greed else 'недоступен'}")
+
+    print("\n[5] Claude API")
+    if engine.advisor is None:
+        print("  LLM выключен или не задан ANTHROPIC_API_KEY " f"(при сбое LLM действует режим {s.llm_fail_mode})")
+    else:
+        now = engine.clock()
+        account = engine.account_state({}) if engine.storage.get("starting_capital") else None
+        if account is None:
+            from .risk import AccountState
+
+            account = AccountState(10_000, 10_000, 0, 0, 0, 0, False, False)
+        positions = [PositionView.from_position(p, p.entry_ref_price, now) for p in engine.storage.open_positions()]
+        ctx = DecisionContext(
+            now=now, mode=s.mode, account=account, max_positions=s.max_open_positions,
+            candidates=list(features.values()), signals=signals, positions=positions,
+            headlines=headlines, fear_greed=fear_greed, news_lookback_hours=s.news_lookback_hours,
+        )
+        try:
+            tokens = engine.advisor.count_prompt_tokens(ctx)
+            print(f"  OK: ключ принят, промпт ~{tokens} входных токенов (подсчёт бесплатный)")
+        except Exception as exc:  # noqa: BLE001
+            ok = False
+            tokens = estimate_input_tokens(engine.advisor.system_prompt, build_user_prompt(ctx))
+            print(f"  ОШИБКА: {exc}")
+        per_call_typ = tokens_cost(s.llm_model, tokens, 1200)
+        per_call_max = tokens_cost(s.llm_model, tokens, s.llm_max_tokens)
+        print(f"  стоимость вызова: обычно ~${per_call_typ:.4f}, максимум ${per_call_max:.4f}; "
+              f"раз в час ~${per_call_typ * 24 * 30:.2f}/мес (лимит ${s.llm_monthly_budget_usd:.2f} соблюдается кодом)")
+        start, end = month_bounds(now)
+        print(f"  потрачено в этом месяце: ${engine.storage.llm_spent(start, end):.4f}")
+
+    print("\n[6] Telegram")
+    if engine.notifier.enabled:
+        sent = engine.notifier.send("✅ Проверка связи: бот видит этот чат.")
+        print("  OK: тестовое сообщение отправлено" if sent else "  ОШИБКА: сообщение не отправлено (см. лог)")
+        ok = ok and sent
+    else:
+        print("  не настроен (TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID) — уведомления будут только в логе")
+
+    print("\nИтог:", "всё готово к запуску" if ok else "есть ошибки, см. выше")
+    return 0 if ok else 1
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="python -m trader", description="Binance spot бот с Claude")
+    parser.add_argument("command", choices=["check", "once", "run", "status", "report", "close-all", "reset-kill-switch", "reset"])
+    parser.add_argument("--env", default=".env", help="путь к .env (по умолчанию ./.env)")
+    parser.add_argument("--yes", action="store_true", help="подтверждение для reset")
+    args = parser.parse_args(argv)
+
+    try:
+        settings = Settings.from_env(args.env)
+    except ConfigError as exc:
+        print(exc, file=sys.stderr)
+        return 2
+    setup_logging(settings)
+
+    if args.command == "reset":
+        if not args.yes:
+            print("Удалит всю историю бота в", settings.db_path, "— добавьте --yes для подтверждения")
+            return 1
+        engine = build_engine(settings)
+        if engine.storage.open_positions():
+            print("Есть открытые позиции. Сначала закройте их: python -m trader close-all")
+            return 1
+        engine.storage.close()
+        settings.db_path.unlink(missing_ok=True)
+        print("База состояния удалена:", settings.db_path)
+        return 0
+
+    engine = build_engine(settings)
+    if args.command == "check":
+        return cmd_check(engine)
+    if args.command == "run":
+        engine.run_forever()
+        return 0
+
+    engine.startup()
+    if args.command == "once":
+        summary = engine.run_hourly_cycle()
+        print(engine.status())
+        print(f"\nУниверс: {', '.join(summary.universe)}")
+        print(f"Сигналы: {', '.join(summary.signals) or 'нет'}")
+        print(f"Куплено: {', '.join(summary.opened) or 'нет'}; продано: {', '.join(summary.closed) or 'нет'}")
+        for line in summary.rejected:
+            print(f"Отклонено: {line}")
+        print(f"LLM: {summary.llm_status} (${summary.llm_cost:.4f})")
+        if summary.llm_report:
+            print(f"Отчёт LLM: {summary.llm_report}")
+    elif args.command == "status":
+        print(engine.status())
+    elif args.command == "report":
+        print(engine.send_daily_report())
+    elif args.command == "close-all":
+        print(f"Закрыто позиций: {engine.close_all('manual')}")
+    elif args.command == "reset-kill-switch":
+        engine.storage.set("kill_switch", False)
+        account = engine.account_state()
+        engine.storage.set("peak_equity", account.equity)
+        print(f"Аварийная остановка снята, пик капитала сброшен на {account.equity:,.2f}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
