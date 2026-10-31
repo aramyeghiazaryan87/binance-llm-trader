@@ -50,18 +50,31 @@ def build_broker(settings: Settings, storage: Storage, data: MarketData) -> Brok
         secret=settings.binance_api_secret,
         sandbox=settings.mode == "testnet",
         demo=settings.mode == "demo",
-        trust_env=settings.http_trust_env,
     )
     return CcxtBroker(exchange, settings.mode, settings.quote_asset)
+
+
+def anthropic_api_key() -> str | None:
+    """Ключ Anthropic API для бота.
+
+    TRADER_ANTHROPIC_API_KEY — запасное имя: облачная среда Claude Code не передаёт
+    ANTHROPIC_API_KEY в сессию (он зарезервирован под авторизацию самого Claude Code).
+    """
+    return os.getenv("ANTHROPIC_API_KEY") or os.getenv("TRADER_ANTHROPIC_API_KEY") or None
 
 
 def build_advisor(settings: Settings, storage: Storage) -> LLMAdvisor | None:
     if not settings.llm_enabled:
         return None
-    if not settings.anthropic_api_key and not os.getenv("ANTHROPIC_AUTH_TOKEN"):
-        log.warning("ANTHROPIC_API_KEY (или TRADER_ANTHROPIC_API_KEY) не задан: LLM отключён, действует LLM_FAIL_MODE=%s", settings.llm_fail_mode)
+    api_key = anthropic_api_key()
+    if not api_key and not os.getenv("ANTHROPIC_AUTH_TOKEN"):
+        log.warning(
+            "ANTHROPIC_API_KEY (или TRADER_ANTHROPIC_API_KEY) не задан: LLM отключён, действует LLM_FAIL_MODE=%s",
+            settings.llm_fail_mode,
+        )
         return None
     return LLMAdvisor(
+        api_key=api_key,
         storage=storage,
         budget=BudgetGuard(storage, settings.llm_monthly_budget_usd),
         model=settings.llm_model,
@@ -69,21 +82,16 @@ def build_advisor(settings: Settings, storage: Storage) -> LLMAdvisor | None:
         max_tokens=settings.llm_max_tokens,
         max_watchlist=settings.max_watchlist,
         use_fallbacks=settings.llm_fallbacks,
-        api_key=settings.anthropic_api_key,
     )
 
 
 def build_engine(settings: Settings) -> TradingEngine:
     storage = Storage(settings.db_path)
     if settings.market_data_source == "mainnet":
-        data = MarketData(make_binance(public_url=settings.market_data_url, trust_env=settings.http_trust_env), name="mainnet")
+        data = MarketData(make_binance(public_url=settings.market_data_url), name="mainnet")
     else:
         data = MarketData(
-            make_binance(
-                sandbox=settings.mode == "testnet",
-                demo=settings.mode == "demo",
-                trust_env=settings.http_trust_env,
-            ),
+            make_binance(sandbox=settings.mode == "testnet", demo=settings.mode == "demo"),
             name=settings.mode,
         )
     broker = build_broker(settings, storage, data)

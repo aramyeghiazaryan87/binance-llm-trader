@@ -389,7 +389,7 @@ class TradingEngine:
         features: dict[str, Features],
     ) -> LLMResult:
         if not self.s.llm_enabled or self.advisor is None:
-            return LLMResult(status="disabled", detail="LLM выключен или нет ANTHROPIC_API_KEY")
+            return LLMResult(status="disabled", detail="LLM выключен или нет ANTHROPIC_API_KEY / TRADER_ANTHROPIC_API_KEY")
         if account.kill_switch:
             return LLMResult(status="skipped", detail="аварийная остановка включена, LLM не нужен")
         if not candidates and not positions:

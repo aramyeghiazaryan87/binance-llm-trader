@@ -298,7 +298,7 @@ class LLMAdvisor:
         max_watchlist: int,
         use_fallbacks: bool = True,
         client: Any | None = None,
-        api_key: str = "",
+        api_key: str | None = None,
     ):
         self.storage = storage
         self.budget = budget
@@ -307,11 +307,9 @@ class LLMAdvisor:
         self.max_tokens = max_tokens
         self.max_watchlist = max_watchlist
         self.use_fallbacks = use_fallbacks
-        # пустой api_key = SDK сам читает ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN
+        # api_key=None: SDK сам возьмёт ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN из окружения
         self.client = (
-            client
-            if client is not None
-            else anthropic.Anthropic(api_key=api_key or None, max_retries=2, timeout=180.0)
+            client if client is not None else anthropic.Anthropic(api_key=api_key, max_retries=2, timeout=180.0)
         )
 
     @property

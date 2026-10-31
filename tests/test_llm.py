@@ -115,3 +115,20 @@ def test_advisor_refusal_and_budget_skip(tmp_path, now):
     result = poor.decide(ctx)
     assert result.status == "skipped" and "исчерпан" in result.detail
     assert len(client.calls) == 1  # второй вызов до API не дошёл
+
+
+def test_build_advisor_reads_fallback_key_name(settings, monkeypatch):
+    """В облаке Claude Code ANTHROPIC_API_KEY не доходит до сессии, берём TRADER_ANTHROPIC_API_KEY."""
+    from trader.app import build_advisor
+
+    for name in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "TRADER_ANTHROPIC_API_KEY"):
+        monkeypatch.delenv(name, raising=False)
+    storage = Storage(settings.db_path)
+    assert build_advisor(settings, storage) is None
+
+    monkeypatch.setenv("TRADER_ANTHROPIC_API_KEY", "sk-ant-fallback")
+    advisor = build_advisor(settings, storage)
+    assert advisor is not None and advisor.client.api_key == "sk-ant-fallback"
+
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-main")  # основное имя в приоритете
+    assert build_advisor(settings, storage).client.api_key == "sk-ant-main"

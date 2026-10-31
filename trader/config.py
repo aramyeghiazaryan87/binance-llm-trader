@@ -69,7 +69,6 @@ class Settings:
     binance_api_secret: str = field(default="", repr=False)
     telegram_bot_token: str = field(default="", repr=False)
     telegram_chat_id: str = ""
-    anthropic_api_key: str = field(default="", repr=False)
 
     # --- рынок ---
     quote_asset: str = "USDT"
@@ -81,7 +80,6 @@ class Settings:
     market_data_source: str = "mainnet"  # mainnet | exchange
     market_data_url: str = ""  # например https://data-api.binance.vision (только публичные данные)
     max_price_deviation_pct: float = 3.0
-    http_trust_env: bool = False  # ccxt берёт прокси и CA из окружения (HTTPS_PROXY, REQUESTS_CA_BUNDLE)
 
     # --- бюджет и риск ---
     budget_usdt: float = 0.0  # 0 = весь свободный USDT на старте
@@ -156,7 +154,6 @@ class Settings:
             binance_api_secret=api_secret,
             telegram_bot_token=_str("TELEGRAM_BOT_TOKEN", ""),
             telegram_chat_id=_str("TELEGRAM_CHAT_ID", ""),
-            anthropic_api_key=_str("ANTHROPIC_API_KEY", "") or _str("TRADER_ANTHROPIC_API_KEY", ""),
             quote_asset=_str("QUOTE_ASSET", "USDT").upper(),
             timeframe=_str("TIMEFRAME", "1h"),
             candles_limit=_int("CANDLES_LIMIT", 300),
@@ -166,7 +163,6 @@ class Settings:
             market_data_source=_str("MARKET_DATA_SOURCE", "mainnet").lower(),
             market_data_url=_str("MARKET_DATA_URL", ""),
             max_price_deviation_pct=_float("MAX_PRICE_DEVIATION_PCT", 3.0),
-            http_trust_env=_bool("HTTP_TRUST_ENV", False),
             budget_usdt=_float("BUDGET_USDT", 0.0),
             paper_start_usdt=_float("PAPER_START_USDT", 10_000.0),
             risk_per_trade_pct=_float("RISK_PER_TRADE_PCT", 1.0),
