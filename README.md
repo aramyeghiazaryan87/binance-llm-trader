@@ -284,6 +284,7 @@ python -m trader backtest --days 180 --variant "25 пар:UNIVERSE_SIZE=25" --va
 | Симптом | Причина и решение |
 |---|---|
 | `451` / `restricted location` | Binance недоступен из страны сервера (так же и из облака Claude): запускайте на компьютере или VPS в другой стране |
+| `CERTIFICATE_VERIFY_FAILED: self-signed certificate` на `api.binance.com` | Соединение с Binance перехватывает сеть: VPN, антивирус, провайдер. Бот правильно отказывается соединяться. Проверку TLS не отключайте. Возьмите рыночные данные с официального адреса Binance для них: `MARKET_DATA_URL=https://data-api.binance.vision` в `.env`. Если в VPN есть «защита веба», добавьте исключение для `*.binance.com` и `*.binance.vision` |
 | `Timestamp for this request is outside of the recvWindow` | Отстают часы сервера: `sudo timedatectl set-ntp true` |
 | `Invalid API-key, IP, or permissions` | Ключ не от того режима (testnet ≠ live), нет права Spot Trading или IP не в белом списке |
 | `LLM: disabled` | Не задан `ANTHROPIC_API_KEY` (в облаке Claude Code: `TRADER_ANTHROPIC_API_KEY`) или `LLM_ENABLED=false` |
