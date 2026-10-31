@@ -11,6 +11,7 @@
     python -m trader backtest           проверить стратегию на истории (без LLM и без ключей)
         --days 90                       сколько дней истории
         --variant "имя:UNIVERSE_SIZE=25,MIN_VOLUME_RATIO=1.0"   сравнить с другими настройками
+        --universe today                пары по сегодняшнему объёму (быстрее, но оптимистично)
 """
 from __future__ import annotations
 
@@ -118,11 +119,22 @@ def cmd_backtest(settings: Settings, args: argparse.Namespace) -> int:
     import time
     from datetime import datetime, timedelta, timezone
 
-    from .backtest import BacktestConfig, fetch_history, format_comparison, format_result, parse_variant, run_backtest
-    from .market_data import MarketData, make_binance
+    from dataclasses import replace
+
+    from .backtest import (
+        BacktestConfig,
+        fetch_history,
+        format_comparison,
+        format_result,
+        parse_variant,
+        run_backtest,
+        select_pool,
+    )
+    from .market_data import MarketData, is_tradeable_base, make_binance
     from .strategy import timeframe_minutes
 
-    base = BacktestConfig.from_settings(settings)
+    dynamic = args.universe == "dynamic"
+    base = replace(BacktestConfig.from_settings(settings), dynamic_universe=dynamic)
     try:
         variants = [("текущие настройки", base)]
         for spec in args.variant or []:
@@ -136,15 +148,40 @@ def cmd_backtest(settings: Settings, args: argparse.Namespace) -> int:
         return 2
 
     data = MarketData(make_binance(public_url=settings.market_data_url), name="mainnet")
-    if args.symbols:
-        symbols = [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
-    else:
-        need = max(cfg.universe_size for _, cfg in variants)
-        symbols = data.top_symbols(quote=settings.quote_asset, limit=need, min_quote_volume=settings.min_quote_volume)
     now = datetime.now(timezone.utc)
     start = (now - timedelta(days=args.days)).replace(minute=0, second=0, microsecond=0)
     warmup = timedelta(minutes=timeframe_minutes(settings.timeframe) * (max(c.candles_window for _, c in variants) + 5))
     since_ms = int((start - warmup).timestamp() * 1000)
+    need = max(cfg.universe_size for _, cfg in variants)
+
+    if args.symbols:
+        symbols = [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
+    elif not dynamic:
+        symbols = data.top_symbols(quote=settings.quote_asset, limit=need, min_quote_volume=settings.min_quote_volume)
+    else:
+        # все пары к USDT, включая делистнутые: иначе в тест попадут только сегодняшние «выжившие»
+        candidates = sorted(
+            s for s, m in data.markets.items()
+            if m.get("spot") and m.get("quote") == settings.quote_asset and is_tradeable_base(str(m.get("base", "")))
+        )
+        print(f"Дневные свечи по {len(candidates)} парам к {settings.quote_asset} (включая делистнутые)...")
+        day_since = int((start - timedelta(days=2)).timestamp() * 1000)
+        daily = {}
+        for n, symbol in enumerate(candidates, 1):
+            try:
+                frame = fetch_history(data.exchange, symbol, "1d", day_since)
+            except Exception as exc:  # noqa: BLE001
+                log.debug("%s: дневные свечи недоступны: %s", symbol, exc)
+                continue
+            if not frame.empty:
+                daily[symbol] = frame
+            if n % 100 == 0:
+                print(f"  {n}/{len(candidates)}")
+        min_volume = min(cfg.min_quote_volume for _, cfg in variants)
+        symbols = select_pool(daily, start, top_n=need * args.pool_margin, min_quote_volume=min_volume)
+        delisted = [s for s in symbols if data.markets[s].get("active") is False]
+        print(f"Пул: {len(symbols)} пар хотя бы день были в топ-{need * args.pool_margin} по объёму"
+              + (f", из них сейчас делистнуты: {', '.join(delisted)}" if delisted else ""))
 
     print(f"Загружаю свечи {settings.timeframe} за {args.days} дн. по {len(symbols)} парам...")
     frames = {}
@@ -153,7 +190,11 @@ def cmd_backtest(settings: Settings, args: argparse.Namespace) -> int:
             frames[symbol] = fetch_history(data.exchange, symbol, settings.timeframe, since_ms)
         except Exception as exc:  # noqa: BLE001
             print(f"  {symbol}: свечи недоступны ({exc}), пропускаю")
-    print(f"Период: {start:%Y-%m-%d} — {now:%Y-%m-%d} UTC; пары по убыванию объёма: {', '.join(frames)}")
+    if dynamic:
+        print(f"Период: {start:%Y-%m-%d} — {now:%Y-%m-%d} UTC; список пар пересчитывается каждый час: "
+              f"топ по объёму за 24 часа на тот момент")
+    else:
+        print(f"Период: {start:%Y-%m-%d} — {now:%Y-%m-%d} UTC; пары по сегодняшнему объёму: {', '.join(frames)}")
     print("Claude не участвует: каждый сигнал считается одобренным. Комиссия "
           f"{base.fee_pct}% + проскальзывание {base.slippage_pct}% на каждую сторону.\n")
 
@@ -171,8 +212,14 @@ def cmd_backtest(settings: Settings, args: argparse.Namespace) -> int:
     bench = results[0][1].benchmark_pct
     if bench is not None:
         print(f"Для сравнения: BTC купить и держать за период {bench:+.2f}%")
-    print("Пары выбраны по сегодняшнему объёму, поэтому результат немного оптимистичен "
-          "(в прошлом список лидеров был другим).")
+    if dynamic:
+        hours = results[0][1].universe_hours
+        total = max(len(results[0][1].equity), 1)
+        top = sorted(hours.items(), key=lambda x: -x[1])[:20]
+        print("Чаще всего в списке: " + ", ".join(f"{s.split('/')[0]} {h / total:.0%}" for s, h in top))
+    else:
+        print("Пары выбраны по сегодняшнему объёму, поэтому результат оптимистичен: "
+              "в этот список чаще попадают монеты, которые уже выросли.")
     return 0
 
 
@@ -188,6 +235,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--variant", action="append", help='backtest: "имя:KEY=VALUE,KEY=VALUE" — сравнить с другими настройками'
     )
+    parser.add_argument(
+        "--universe", choices=["dynamic", "today"], default="dynamic",
+        help="backtest: dynamic — топ по объёму на каждый час истории (по умолчанию); today — по сегодняшнему объёму",
+    )
+    parser.add_argument("--pool-margin", type=int, default=2, help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
 
     try:

@@ -15,6 +15,11 @@
 
 Claude здесь не участвует: каждый сигнал считается одобренным с множителем размера
 SIZE_FACTOR. Это проверка самих правил: если они не зарабатывают, фильтр LLM не спасёт.
+
+Список пар (dynamic_universe=True) выбирается каждый час заново, как у живого бота:
+топ UNIVERSE_SIZE по объёму торгов за предыдущие 24 часа среди пула кандидатов.
+Пул собирает select_pool по дневным свечам всех USDT-пар, включая делистнутые, поэтому
+в тест попадают и монеты, которые были в топе тогда, а сегодня упали или исчезли.
 """
 from __future__ import annotations
 
@@ -56,6 +61,8 @@ class BacktestConfig:
     size_factor: float = 1.0
     candles_window: int = 300
     timeframe: str = "1h"
+    min_quote_volume: float = 20_000_000.0
+    dynamic_universe: bool = False  # False: пары в порядке frames, первые universe_size
 
     @classmethod
     def from_settings(cls, s: Any) -> "BacktestConfig":
@@ -83,6 +90,7 @@ class BacktestConfig:
             max_hold_hours=s.max_hold_hours,
             candles_window=s.candles_limit,
             timeframe=s.timeframe,
+            min_quote_volume=s.min_quote_volume,
         )
 
     def with_overrides(self, overrides: dict[str, str]) -> "BacktestConfig":
@@ -96,9 +104,14 @@ class BacktestConfig:
                 if key in types:
                     kind = types[key] if isinstance(types[key], str) else types[key].__name__
                     try:
-                        value: Any = int(raw_value) if kind == "int" else (
-                            float(raw_value) if kind == "float" else str(raw_value)
-                        )
+                        if kind == "bool":
+                            value: Any = str(raw_value).strip().lower() in ("1", "true", "yes", "on", "да")
+                        elif kind == "int":
+                            value = int(raw_value)
+                        elif kind == "float":
+                            value = float(raw_value)
+                        else:
+                            value = str(raw_value)
                     except ValueError as exc:
                         raise ValueError(f"{raw_key}: ожидается число, получено {raw_value!r}") from exc
                     changes[group][key] = value
@@ -171,6 +184,15 @@ class BacktestResult:
     skipped: dict[str, int] = field(default_factory=dict)
     kill_switch_time: datetime | None = None
     benchmark_pct: float | None = None  # BTC buy & hold за тот же период
+    universe_hours: dict[str, int] = field(default_factory=dict)  # сколько часов пара была в списке
+
+    @property
+    def pnl_by_symbol(self) -> dict[str, tuple[int, float]]:
+        out: dict[str, tuple[int, float]] = {}
+        for t in self.trades:
+            n, pnl = out.get(t.symbol, (0, 0.0))
+            out[t.symbol] = (n + 1, pnl + t.pnl)
+        return out
 
     @property
     def weeks(self) -> float:
@@ -240,7 +262,9 @@ def run_backtest(
     fee = cfg.fee_pct / 100.0
     slip = cfg.slippage_pct / 100.0
     tf = timedelta(minutes=timeframe_minutes(cfg.timeframe))
-    symbols = [s for s in frames if not frames[s].empty][: cfg.universe_size]
+    symbols = [s for s in frames if not frames[s].empty]
+    if not cfg.dynamic_universe:
+        symbols = symbols[: cfg.universe_size]
     if start.tzinfo is None:
         start = start.replace(tzinfo=timezone.utc)
 
@@ -252,6 +276,8 @@ def run_backtest(
 
     positions_idx = {s: {ts: i for i, ts in enumerate(frames[s].index)} for s in symbols}
     prefilter = {s: _prefilter(frames[s], params).to_numpy() for s in symbols}
+    closes = {s: frames[s]["close"].to_numpy() for s in symbols}
+    volume_rank = _volume_ranking(frames, symbols, times, cfg) if cfg.dynamic_universe else None
     last_close: dict[str, float] = {}
     cash = cfg.start_usdt
     open_trades: dict[str, Trade] = {}
@@ -305,10 +331,10 @@ def run_backtest(
                 close_trade(trade, c, bar_close, decision.reason)
 
         # 2. оценка капитала на закрытии свечи
-        for symbol in symbols:
+        for symbol in open_trades:
             i = positions_idx[symbol].get(ts)
             if i is not None:
-                last_close[symbol] = float(frames[symbol]["close"].iloc[i])
+                last_close[symbol] = float(closes[symbol][i])
         value = sum(t.qty * last_close.get(t.symbol, t.entry_price) for t in open_trades.values())
         equity = cash + value
         if bar_close.date() != day:
@@ -327,7 +353,10 @@ def run_backtest(
         result.equity.append((bar_close, equity))
 
         # 3. сигналы на закрытой свече ts и входы по её закрытию
-        for symbol in symbols:
+        universe = volume_rank(ts) if volume_rank else symbols
+        for symbol in universe:
+            result.universe_hours[symbol] = result.universe_hours.get(symbol, 0) + 1
+        for symbol in universe:
             i = positions_idx[symbol].get(ts)
             if i is None or not prefilter[symbol][i] or i + 1 < cfg.candles_window:
                 continue
@@ -369,6 +398,7 @@ def run_backtest(
             qty = amount / (price * (1 + slip)) * (1 - fee)
             cash -= amount
             open_trades[symbol] = Trade(symbol, bar_close, price, amount, qty, sig.atr, stop, price)
+            last_close[symbol] = price
 
     end_time = result.end
     for symbol in list(open_trades):
@@ -382,6 +412,49 @@ def run_backtest(
         if not period.empty and period["open"].iloc[0] > 0:
             result.benchmark_pct = (float(period["close"].iloc[-1]) / float(period["open"].iloc[0]) - 1.0) * 100.0
     return result
+
+
+def _volume_ranking(frames: dict[str, pd.DataFrame], symbols: list[str], times: list[datetime], cfg: BacktestConfig):
+    """Функция ts -> топ пар по объёму в USDT за 24 часа, закончившиеся закрытием свечи ts."""
+    bars = max(1, 1440 // timeframe_minutes(cfg.timeframe))
+    index = pd.DatetimeIndex(times)
+    table = pd.DataFrame(
+        {s: (frames[s]["close"] * frames[s]["volume"]).rolling(bars, min_periods=bars).sum().reindex(index) for s in symbols}
+    )
+    names = list(table.columns)
+    values = table.to_numpy()
+    row_of = {ts: i for i, ts in enumerate(times)}
+
+    def top(ts: datetime) -> list[str]:
+        row = values[row_of[ts]]
+        ranked = sorted(
+            (
+                (v, names[j])
+                for j, v in enumerate(row)
+                if v == v and v >= cfg.min_quote_volume  # v == v: не NaN
+            ),
+            reverse=True,
+        )
+        return [name for _, name in ranked[: cfg.universe_size]]
+
+    return top
+
+
+def select_pool(daily: dict[str, pd.DataFrame], start: datetime, top_n: int, min_quote_volume: float) -> list[str]:
+    """Пары, которые хотя бы один день периода были в топ-top_n по дневному объёму в USDT.
+
+    Порядок: по суммарному объёму за период. Так в пул попадают монеты, которые были
+    лидерами тогда, даже если сегодня они упали или делистнуты.
+    """
+    volume = pd.DataFrame({s: d["close"] * d["volume"] for s, d in daily.items() if not d.empty})
+    if volume.empty:
+        return []
+    volume = volume[volume.index >= pd.Timestamp(start).normalize() - pd.Timedelta(days=1)]
+    ranks = volume.where(volume >= min_quote_volume).rank(axis=1, ascending=False, method="first")
+    ever_top = ranks.le(top_n).any(axis=0)
+    chosen = [s for s in volume.columns if ever_top[s]]
+    totals = volume[chosen].sum(axis=0)
+    return sorted(chosen, key=lambda s: -totals[s])
 
 
 def fetch_history(exchange: Any, symbol: str, timeframe: str, since_ms: int, now_ms: int | None = None) -> pd.DataFrame:
@@ -421,6 +494,11 @@ def format_result(result: BacktestResult, title: str = "") -> str:
         lines.append("Пропущено сигналов: " + ", ".join(f"{k} {v}" for k, v in r.skipped.items()))
     if r.kill_switch_time:
         lines.append(f"⛔ Аварийная остановка по просадке: {r.kill_switch_time:%Y-%m-%d %H:%M} UTC")
+    if r.trades:
+        ranked = sorted(r.pnl_by_symbol.items(), key=lambda x: -x[1][1])
+        fmt = lambda items: ", ".join(f"{s.split('/')[0]} {p:+,.0f}" for s, (_, p) in items)  # noqa: E731
+        lines.append(f"Лучшие пары (USDT): {fmt(ranked[:5])}")
+        lines.append(f"Худшие пары (USDT): {fmt(ranked[-5:][::-1])}")
     return "\n".join(lines)
 
 

@@ -3,7 +3,15 @@ from datetime import timedelta
 
 import pytest
 
-from trader.backtest import BacktestConfig, fetch_history, format_comparison, format_result, parse_variant, run_backtest
+from trader.backtest import (
+    BacktestConfig,
+    fetch_history,
+    format_comparison,
+    format_result,
+    parse_variant,
+    run_backtest,
+    select_pool,
+)
 from trader.market_data import ohlcv_to_frame
 
 from .conftest import HOUR_MS, make_candles
@@ -118,3 +126,46 @@ def test_fetch_history_paginates_and_drops_open_candle():
     frame = fetch_history(Paged(), "SOL/USDT", "1h", rows[0][0], now_ms=NOW_MS)
     assert len(frame) == 2500 and Paged.calls == 3
     assert frame.index.is_monotonic_increasing
+
+
+def test_dynamic_universe_follows_volume_at_the_time():
+    """Сигнал засчитывается, только если пара в тот час была в топе по объёму, а не сегодня."""
+    frame, sig_time = frame_with_tail([])
+    loud, quiet = frame.copy(), frame.copy()
+    loud["volume"] *= 1e6  # объём в USDT ~ 1e10 за сутки: проходит MIN_QUOTE_VOLUME
+    cfg = BacktestConfig(dynamic_universe=True, universe_size=1, min_quote_volume=1e6)
+    result = run_backtest({"QUIET/USDT": quiet, "LOUD/USDT": loud}, cfg, start_before(frame, sig_time))
+
+    assert set(result.universe_hours) == {"LOUD/USDT"}
+    assert result.signals == 1 and [t.symbol for t in result.trades] == ["LOUD/USDT"]
+
+    # тот же сигнал не учитывается, если объём пары ниже порога
+    none = run_backtest({"QUIET/USDT": quiet}, cfg, start_before(frame, sig_time))
+    assert none.signals == 0 and none.universe_hours == {}
+
+
+def test_select_pool_keeps_past_leaders():
+    import pandas as pd
+
+    days = pd.date_range("2026-01-01", periods=4, freq="D", tz="UTC")
+
+    def daily(volumes):
+        return pd.DataFrame({"close": 1.0, "volume": volumes}, index=days)
+
+    pool = select_pool(
+        {
+            "OLD/USDT": daily([9e8, 9e8, 0.0, 0.0]),  # лидер в начале, потом делистинг
+            "BIG/USDT": daily([5e8, 5e8, 5e8, 5e8]),
+            "NEW/USDT": daily([0.0, 0.0, 1e9, 1e9]),
+            "TINY/USDT": daily([1e6, 1e6, 1e6, 1e6]),  # ниже MIN_QUOTE_VOLUME
+            "MID/USDT": daily([1e8, 1e8, 1e8, 1e8]),  # ни разу не в топ-2
+        },
+        start=days[1].to_pydatetime(),
+        top_n=2,
+        min_quote_volume=2e7,
+    )
+    assert pool == ["BIG/USDT", "NEW/USDT", "OLD/USDT"]
+
+
+def test_bool_override():
+    assert BacktestConfig().with_overrides({"DYNAMIC_UNIVERSE": "true"}).dynamic_universe is True
