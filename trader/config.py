@@ -102,7 +102,7 @@ class Settings:
     breakout_lookback: int = 20
     min_volume_ratio: float = 1.2
     # фильтр рынка: новые входы только когда REGIME_SYMBOL закрылся выше дневной EMA(REGIME_EMA)
-    regime_filter: bool = False
+    regime_filter: bool = True
     regime_symbol: str = "BTC/USDT"
     regime_ema: int = 200
 
@@ -184,7 +184,7 @@ class Settings:
             atr_trail_mult=_float("ATR_TRAIL_MULT", 3.0),
             breakout_lookback=_int("BREAKOUT_LOOKBACK", 20),
             min_volume_ratio=_float("MIN_VOLUME_RATIO", 1.2),
-            regime_filter=_bool("REGIME_FILTER", False),
+            regime_filter=_bool("REGIME_FILTER", True),
             regime_symbol=_str("REGIME_SYMBOL", "BTC/USDT").upper(),
             regime_ema=_int("REGIME_EMA", 200),
             llm_enabled=_bool("LLM_ENABLED", True),
