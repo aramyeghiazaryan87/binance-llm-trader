@@ -34,7 +34,10 @@ def cmd_check(engine) -> int:
     s = engine.s
     ok = True
     print(f"Режим: {s.mode} | данные: {s.market_data_source} | модель: {s.llm_model if s.llm_enabled else 'LLM выключен'}")
-    print(f"Бюджет LLM: ${s.llm_monthly_budget_usd:.2f}/мес, effort={s.llm_effort}, max_tokens={s.llm_max_tokens}")
+    print(
+        f"Бюджет LLM: ${s.llm_monthly_budget_usd:.2f}/мес, effort={s.llm_effort} "
+        f"(при сигнале или открытой позиции {s.llm_effort_signals}), max_tokens={s.llm_max_tokens}"
+    )
 
     print("\n[1] Рыночные данные")
     try:

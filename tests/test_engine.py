@@ -43,6 +43,7 @@ def build(settings, now, *, responder=None, storage=None, exchange=None):
         client = FakeClaude(responder)
         advisor = LLMAdvisor(storage=storage, budget=BudgetGuard(storage, settings.llm_monthly_budget_usd),
                              model=settings.llm_model, effort=settings.llm_effort, max_tokens=settings.llm_max_tokens,
+                             effort_signals=settings.llm_effort_signals,
                              max_watchlist=settings.max_watchlist, client=client)
     clock = Clock(now)
     notifier = FakeNotifier()

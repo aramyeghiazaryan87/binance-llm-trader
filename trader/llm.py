@@ -125,6 +125,7 @@ class LLMResult:
     output_tokens: int = 0
     model: str = ""
     notes: list[str] = field(default_factory=list)
+    effort: str = ""
 
     @property
     def ok(self) -> bool:
@@ -299,11 +300,13 @@ class LLMAdvisor:
         use_fallbacks: bool = True,
         client: Any | None = None,
         api_key: str | None = None,
+        effort_signals: str | None = None,
     ):
         self.storage = storage
         self.budget = budget
         self.model = model
         self.effort = effort
+        self.effort_signals = effort_signals or effort
         self.max_tokens = max_tokens
         self.max_watchlist = max_watchlist
         self.use_fallbacks = use_fallbacks
@@ -328,14 +331,21 @@ class LLMAdvisor:
         )
         return result
 
-    def _request(self, user_prompt: str, with_fallbacks: bool) -> Any:
+    def effort_for(self, ctx: DecisionContext) -> str:
+        """Глубже думаем, когда решение касается денег: есть сигнал на вход или открытая позиция.
+
+        Замер 31.10.2026 на реальном сигнале: medium дороже low примерно на 5% ($0.0114 против $0.0109).
+        """
+        return self.effort_signals if (ctx.signals or ctx.positions) else self.effort
+
+    def _request(self, user_prompt: str, with_fallbacks: bool, effort: str) -> Any:
         kwargs: dict[str, Any] = {
             "model": self.model,
             "max_tokens": self.max_tokens,
             "system": self.system_prompt,
             "messages": [{"role": "user", "content": user_prompt}],
             "output_format": MarketAssessment,
-            "output_config": {"effort": self.effort},
+            "output_config": {"effort": effort},
         }
         if with_fallbacks:
             # при отказе по политике безопасности API само повторит запрос на запасной модели
@@ -346,6 +356,7 @@ class LLMAdvisor:
     def decide(self, ctx: DecisionContext) -> LLMResult:
         now = ctx.now
         user_prompt = build_user_prompt(ctx)
+        effort = self.effort_for(ctx)
         est_in = estimate_input_tokens(self.system_prompt, user_prompt, SCHEMA_TEXT)
         worst = worst_case_cost(self.model, est_in, self.max_tokens)
         allowed, why = self.budget.check(now, worst, has_signals=bool(ctx.signals))
@@ -355,13 +366,13 @@ class LLMAdvisor:
 
         try:
             try:
-                response = self._request(user_prompt, self.use_fallbacks)
+                response = self._request(user_prompt, self.use_fallbacks, effort)
             except anthropic.BadRequestError as exc:
                 if not self.use_fallbacks or "fallback" not in str(exc).lower():
                     raise
                 log.warning("параметр fallbacks не принят (%s), повторяю без него", exc)
                 self.use_fallbacks = False
-                response = self._request(user_prompt, False)
+                response = self._request(user_prompt, False, effort)
         except pydantic.ValidationError as exc:
             # ответ пришёл, но не по схеме (например, обрезан): токены потрачены, считаем по худшему случаю
             return self._record(now, LLMResult(status="invalid", detail=f"ответ не по схеме: {exc.errors()[:2]}", cost_usd=worst, model=self.model))
@@ -380,7 +391,8 @@ class LLMAdvisor:
 
         cost, tokens_in, tokens_out = usage_cost(response.usage, self.model)
         served_by = str(getattr(response, "model", "") or self.model)
-        base = {"cost_usd": cost, "input_tokens": tokens_in, "output_tokens": tokens_out, "model": served_by}
+        base = {"cost_usd": cost, "input_tokens": tokens_in, "output_tokens": tokens_out, "model": served_by,
+                "effort": effort}
 
         if response.stop_reason == "refusal":
             category = getattr(getattr(response, "stop_details", None), "category", None)

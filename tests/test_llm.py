@@ -132,3 +132,45 @@ def test_build_advisor_reads_fallback_key_name(settings, monkeypatch):
 
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-main")  # основное имя в приоритете
     assert build_advisor(settings, storage).client.api_key == "sk-ant-main"
+
+
+def test_effort_rises_only_when_money_is_at_stake(now):
+    from dataclasses import replace
+
+    from trader.llm import PositionView
+
+    storage = Storage(":memory:")
+    client = FakeClaude(approving_responder())
+    advisor = LLMAdvisor(storage=storage, budget=BudgetGuard(storage, 10.0), model="claude-sonnet-5-5",
+                         effort="low", effort_signals="medium", max_tokens=4000, max_watchlist=5, client=client)
+    ctx, _ = make_ctx(now)
+
+    with_signal = advisor.decide(ctx)
+    assert client.calls[-1]["output_config"] == {"effort": "medium"}
+    assert with_signal.effort == "medium"
+
+    quiet = advisor.decide(replace(ctx, signals=[]))
+    assert client.calls[-1]["output_config"] == {"effort": "low"} and quiet.effort == "low"
+
+    position = PositionView(symbol="BTC/USDT", entry_price=60_000, price=61_000, pnl_pct=1.7, held_hours=3, stop_price=58_000)
+    advisor.decide(replace(ctx, signals=[], positions=[position]))
+    assert client.calls[-1]["output_config"] == {"effort": "medium"}
+
+    # без отдельной настройки effort везде один
+    same = LLMAdvisor(storage=storage, budget=BudgetGuard(storage, 10.0), model="claude-sonnet-5-5",
+                      effort="low", max_tokens=4000, max_watchlist=5, client=client)
+    same.decide(ctx)
+    assert client.calls[-1]["output_config"] == {"effort": "low"}
+
+
+def test_effort_signals_setting_is_validated(monkeypatch, tmp_path):
+    from trader.config import ConfigError, Settings
+
+    monkeypatch.setenv("TRADING_MODE", "paper")
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    assert Settings.from_env(None).llm_effort_signals == "medium"
+    monkeypatch.setenv("LLM_EFFORT_SIGNALS", "High")
+    assert Settings.from_env(None).llm_effort_signals == "high"
+    monkeypatch.setenv("LLM_EFFORT_SIGNALS", "turbo")
+    with pytest.raises(ConfigError, match="LLM_EFFORT_SIGNALS"):
+        Settings.from_env(None)

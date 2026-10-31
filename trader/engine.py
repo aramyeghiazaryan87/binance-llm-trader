@@ -582,11 +582,12 @@ class TradingEngine:
                     "report": a.report,
                     "cost_usd": result.cost_usd,
                     "model": result.model,
+                    "effort": result.effort,
                     "notes": result.notes,
                 },
             )
-            log.info("LLM: режим=%s, новости=%+.2f, watchlist=%s, $%.4f", a.market_regime, a.news_sentiment,
-                     [w.symbol for w in a.watchlist], result.cost_usd)
+            log.info("LLM: режим=%s, новости=%+.2f, watchlist=%s, effort=%s, $%.4f", a.market_regime,
+                     a.news_sentiment, [w.symbol for w in a.watchlist], result.effort, result.cost_usd)
         else:
             log.info("LLM: %s — %s", result.status, result.detail)
 

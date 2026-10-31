@@ -123,6 +123,7 @@ def build_advisor(settings: Settings, storage: Storage) -> LLMAdvisor | None:
         budget=BudgetGuard(storage, settings.llm_monthly_budget_usd),
         model=settings.llm_model,
         effort=settings.llm_effort,
+        effort_signals=settings.llm_effort_signals,
         max_tokens=settings.llm_max_tokens,
         max_watchlist=settings.max_watchlist,
         use_fallbacks=settings.llm_fallbacks,

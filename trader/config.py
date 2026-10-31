@@ -110,6 +110,7 @@ class Settings:
     llm_enabled: bool = True
     llm_model: str = "claude-sonnet-5-5"
     llm_effort: str = "low"
+    llm_effort_signals: str = "medium"  # effort, когда есть сигнал на вход или открытая позиция
     llm_max_tokens: int = 4000
     llm_monthly_budget_usd: float = 10.0
     llm_min_minutes_between_calls: float = 50.0
@@ -190,6 +191,7 @@ class Settings:
             llm_enabled=_bool("LLM_ENABLED", True),
             llm_model=_str("LLM_MODEL", "claude-sonnet-5-5"),
             llm_effort=_str("LLM_EFFORT", "low").lower(),
+            llm_effort_signals=_str("LLM_EFFORT_SIGNALS", "medium").lower(),
             llm_max_tokens=_int("LLM_MAX_TOKENS", 4000),
             llm_monthly_budget_usd=_float("LLM_MONTHLY_BUDGET_USD", 10.0),
             llm_min_minutes_between_calls=_float("LLM_MIN_MINUTES_BETWEEN_CALLS", 50.0),
@@ -237,6 +239,8 @@ class Settings:
             p.append("MARKET_DATA_URL должен начинаться с https://")
         if self.mode == "paper" and self.market_data_source != "mainnet":
             p.append("в режиме paper данные берутся только с mainnet (MARKET_DATA_SOURCE=mainnet)")
+        if self.llm_effort_signals not in ("low", "medium", "high", "xhigh", "max"):
+            p.append("LLM_EFFORT_SIGNALS должен быть low, medium, high, xhigh или max")
         if self.llm_effort not in ("low", "medium", "high", "xhigh", "max"):
             p.append("LLM_EFFORT должен быть low, medium, high, xhigh или max")
         if self.llm_fail_mode not in ("hold", "rules"):
