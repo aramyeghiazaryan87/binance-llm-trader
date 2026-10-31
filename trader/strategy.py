@@ -149,6 +149,27 @@ def compute_features(symbol: str, df: pd.DataFrame, params: StrategyParams, time
     )
 
 
+def regime_series(daily: pd.DataFrame, ema_period: int) -> pd.Series:
+    """Фильтр рынка по дневным свечам BTC: True, если закрытие выше дневной EMA.
+
+    Индекс: время ЗАКРЫТИЯ дневной свечи (открытие + 1 день), чтобы в момент t использовать
+    только уже закрытые дни. Пока истории не хватает на EMA, значение False (входов нет).
+    """
+    if daily is None or daily.empty:
+        return pd.Series(dtype=bool)
+    close = daily["close"]
+    line = ema(close, ema_period)
+    ok = (close > line) & line.notna()
+    ok.index = daily.index + pd.Timedelta(days=1)
+    return ok.astype(bool)
+
+
+def regime_ok(daily: pd.DataFrame, ema_period: int) -> bool:
+    """Текущее состояние фильтра рынка по последнему закрытому дню."""
+    series = regime_series(daily, ema_period)
+    return bool(series.iloc[-1]) if len(series) else False
+
+
 def entry_conditions(f: Features, params: StrategyParams) -> dict[str, bool]:
     return {
         "above_ema200": f.price > f.ema_slow,

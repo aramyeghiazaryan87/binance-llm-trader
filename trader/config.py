@@ -101,6 +101,10 @@ class Settings:
     atr_trail_mult: float = 3.0
     breakout_lookback: int = 20
     min_volume_ratio: float = 1.2
+    # фильтр рынка: новые входы только когда REGIME_SYMBOL закрылся выше дневной EMA(REGIME_EMA)
+    regime_filter: bool = False
+    regime_symbol: str = "BTC/USDT"
+    regime_ema: int = 200
 
     # --- LLM ---
     llm_enabled: bool = True
@@ -180,6 +184,9 @@ class Settings:
             atr_trail_mult=_float("ATR_TRAIL_MULT", 3.0),
             breakout_lookback=_int("BREAKOUT_LOOKBACK", 20),
             min_volume_ratio=_float("MIN_VOLUME_RATIO", 1.2),
+            regime_filter=_bool("REGIME_FILTER", False),
+            regime_symbol=_str("REGIME_SYMBOL", "BTC/USDT").upper(),
+            regime_ema=_int("REGIME_EMA", 200),
             llm_enabled=_bool("LLM_ENABLED", True),
             llm_model=_str("LLM_MODEL", "claude-sonnet-5-5"),
             llm_effort=_str("LLM_EFFORT", "low").lower(),
@@ -244,6 +251,8 @@ class Settings:
             p.append("MAX_TOTAL_EXPOSURE_PCT должен быть в диапазоне (0, 100]")
         if self.max_open_positions < 1:
             p.append("MAX_OPEN_POSITIONS должен быть >= 1")
+        if self.regime_ema < 2:
+            p.append("REGIME_EMA должен быть >= 2")
         if self.candles_limit < 230:
             p.append("CANDLES_LIMIT должен быть >= 230 (нужно для EMA200)")
         if not 0 <= self.daily_report_hour_utc <= 23:

@@ -40,7 +40,7 @@ import pandas as pd
 from .indicators import rolling_high, sma
 from .market_data import ohlcv_to_frame
 from .risk import AccountState, RiskLimits, RiskManager
-from .strategy import StrategyParams, compute_features, entry_signal, evaluate_exit, timeframe_minutes
+from .strategy import StrategyParams, compute_features, entry_signal, evaluate_exit, regime_series, timeframe_minutes
 
 log = logging.getLogger(__name__)
 
@@ -71,6 +71,8 @@ class BacktestConfig:
     # 0 = как у живого бота: после аварийной остановки сделок больше нет (снимается только вручную).
     # >0 = остановка снимается через столько часов, пик капитала сбрасывается (как reset-kill-switch).
     kill_switch_reset_hours: float = 0.0
+    regime_filter: bool = False  # входы только когда BTC выше дневной EMA(regime_ema), как REGIME_FILTER
+    regime_ema: int = 200
 
     @classmethod
     def from_settings(cls, s: Any) -> "BacktestConfig":
@@ -99,6 +101,8 @@ class BacktestConfig:
             candles_window=s.candles_limit,
             timeframe=s.timeframe,
             min_quote_volume=s.min_quote_volume,
+            regime_filter=s.regime_filter,
+            regime_ema=s.regime_ema,
         )
 
     def with_overrides(self, overrides: dict[str, str]) -> "BacktestConfig":
@@ -194,6 +198,7 @@ class BacktestResult:
     benchmark_pct: float | None = None  # BTC buy & hold за тот же период
     benchmark_closes: pd.Series | None = None  # закрытия BTC за период, для помесячной разбивки
     universe_hours: dict[str, int] = field(default_factory=dict)  # сколько часов пара была в списке
+    regime_off_hours: int = 0  # часов, когда фильтр рынка запрещал входы
 
     @property
     def kill_switch_time(self) -> datetime | None:
@@ -267,8 +272,12 @@ def run_backtest(
     config: BacktestConfig,
     start: datetime,
     end: datetime | None = None,
+    regime_daily: pd.DataFrame | None = None,
 ) -> BacktestResult:
-    """frames: свечи по парам в порядке приоритета (ликвидности), включая историю для разогрева индикаторов."""
+    """frames: свечи по парам в порядке приоритета (ликвидности), включая историю для разогрева индикаторов.
+
+    regime_daily: дневные свечи BTC (с запасом истории на EMA), нужны при cfg.regime_filter.
+    """
     cfg = config
     params = cfg.params
     risk = RiskManager(cfg.limits)
@@ -291,6 +300,16 @@ def run_backtest(
     prefilter = {s: _prefilter(frames[s], params).to_numpy() for s in symbols}
     closes = {s: frames[s]["close"].to_numpy() for s in symbols}
     volume_rank = _volume_ranking(frames, symbols, times, cfg) if cfg.dynamic_universe else None
+    regime_at = None
+    if cfg.regime_filter:
+        if regime_daily is None or regime_daily.empty:
+            raise ValueError("для regime_filter нужны дневные свечи BTC (regime_daily)")
+        regime = regime_series(regime_daily, cfg.regime_ema)
+        regime_times, regime_values = regime.index, regime.to_numpy()
+
+        def regime_at(t: datetime) -> bool:
+            pos = regime_times.searchsorted(t, side="right") - 1  # последний день, закрытый к моменту t
+            return bool(regime_values[pos]) if pos >= 0 else False
     last_close: dict[str, float] = {}
     cash = cfg.start_usdt
     open_trades: dict[str, Trade] = {}
@@ -374,6 +393,9 @@ def run_backtest(
         universe = volume_rank(ts) if volume_rank else symbols
         for symbol in universe:
             result.universe_hours[symbol] = result.universe_hours.get(symbol, 0) + 1
+        market_ok = regime_at(bar_close) if regime_at else True
+        if not market_ok:
+            result.regime_off_hours += 1
         for symbol in universe:
             i = positions_idx[symbol].get(ts)
             if i is None or not prefilter[symbol][i] or i + 1 < cfg.candles_window:
@@ -389,6 +411,9 @@ def run_backtest(
             if until and until > bar_close:
                 continue
             result.signals += 1
+            if not market_ok:
+                skip("фильтр рынка")
+                continue
             positions_value = sum(t.qty * last_close.get(t.symbol, t.entry_price) for t in open_trades.values())
             account = AccountState(
                 equity=cash + positions_value,
@@ -580,6 +605,8 @@ def format_result(result: BacktestResult, title: str = "") -> str:
         lines.append(f"Среднее удержание: {avg_hold:.0f} ч; выходы: {reasons}")
     if r.skipped:
         lines.append("Пропущено сигналов: " + ", ".join(f"{k} {v}" for k, v in r.skipped.items()))
+    if r.config.regime_filter and r.equity:
+        lines.append(f"Фильтр рынка запрещал входы {r.regime_off_hours / len(r.equity):.0%} времени")
     if r.kill_switch_times:
         when = ", ".join(f"{t:%Y-%m-%d}" for t in r.kill_switch_times)
         lines.append(f"⛔ Аварийная остановка по просадке: {len(r.kill_switch_times)} раз ({when})")

@@ -196,6 +196,16 @@ def cmd_backtest(settings: Settings, args: argparse.Namespace) -> int:
         print(f"Пул: {len(symbols)} пар хотя бы день были в топ-{need * args.pool_margin} по объёму"
               + (f", из них сейчас делистнуты: {', '.join(delisted)}" if delisted else ""))
 
+    regime_daily = None
+    regime_emas = [cfg.regime_ema for _, cfg in variants if cfg.regime_filter]
+    if regime_emas:
+        regime_since = int((start - timedelta(days=max(regime_emas) * 2 + 10)).timestamp() * 1000)
+        try:
+            regime_daily = cache.history(data.exchange, settings.regime_symbol, "1d", regime_since)
+        except Exception as exc:  # noqa: BLE001
+            print(f"Дневные свечи {settings.regime_symbol} для фильтра рынка недоступны: {exc}", file=sys.stderr)
+            return 1
+
     print(f"Загружаю свечи {settings.timeframe} за {args.days} дн. по {len(symbols)} парам...")
     t0 = time.time()
     frames, errors = fetch_many(
@@ -218,7 +228,7 @@ def cmd_backtest(settings: Settings, args: argparse.Namespace) -> int:
     results = []
     for name, cfg in variants:
         t0 = time.time()
-        result = run_backtest(frames, cfg, start)
+        result = run_backtest(frames, cfg, start, regime_daily=regime_daily)
         results.append((name, result))
         print(format_result(result, name))
         log.debug("вариант %s посчитан за %.1f с", name, time.time() - t0)
@@ -307,6 +317,8 @@ def main(argv: list[str] | None = None) -> int:
         print(engine.status())
         print(f"\nУниверс: {', '.join(summary.universe)}")
         print(f"Сигналы: {', '.join(summary.signals) or 'нет'}")
+        if summary.regime:
+            print(f"Фильтр рынка: {summary.regime}")
         print(f"Куплено: {', '.join(summary.opened) or 'нет'}; продано: {', '.join(summary.closed) or 'нет'}")
         for line in summary.rejected:
             print(f"Отклонено: {line}")

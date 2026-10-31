@@ -87,3 +87,20 @@ def test_exit_rules():
     # стоп по времени
     d = evaluate_exit(stop_price=98.0, highest_price=101.0, price=100.5, held_hours=97, **common)
     assert d.should_exit and d.reason == "time_stop"
+
+
+def test_regime_uses_only_closed_days():
+    import pandas as pd
+
+    from trader.strategy import regime_ok, regime_series
+
+    days = pd.date_range("2026-01-01", periods=60, freq="D", tz="UTC")
+    up = pd.DataFrame({"close": [100.0 + i for i in range(60)]}, index=days)
+    series = regime_series(up, 20)
+    assert series.index[0] == days[0] + pd.Timedelta(days=1)  # значение дня доступно после его закрытия
+    assert not series.iloc[:19].any()  # пока EMA не посчитана, входов нет
+    assert series.iloc[-1] and regime_ok(up, 20)
+
+    down = up.assign(close=up["close"][::-1].to_numpy())
+    assert not regime_ok(down, 20)
+    assert not regime_ok(up.iloc[:0], 20)

@@ -272,3 +272,27 @@ def test_fetch_many_reports_errors_and_retries(monkeypatch):
     assert list(frames) == ["FLAKY/USDT"] and len(frames["FLAKY/USDT"]) == 50
     assert "нет такой пары" in errors["BAD/USDT"]
     assert sorted(seen) == [1, 2]
+
+
+def test_regime_filter_in_backtest():
+    import pandas as pd
+
+    frame, sig_time = frame_with_tail([])
+    p = float(frame.loc[sig_time, "close"])
+    frame, sig_time = frame_with_tail([(p, p * 1.001, p * 0.999, p)] * 3)
+    days = pd.date_range(end=sig_time.normalize() - pd.Timedelta(days=1), periods=300, freq="D")
+    rising = pd.DataFrame({"close": [100.0 + i for i in range(300)]}, index=days)
+    falling = rising.assign(close=rising["close"][::-1].to_numpy())
+    cfg = BacktestConfig(regime_filter=True, regime_ema=200)
+    start = start_before(frame, sig_time)
+
+    ok = run_backtest({"SOL/USDT": frame}, cfg, start, regime_daily=rising)
+    assert len(ok.trades) == 1 and ok.regime_off_hours == 0
+
+    blocked = run_backtest({"SOL/USDT": frame}, cfg, start, regime_daily=falling)
+    assert blocked.trades == [] and blocked.skipped == {"фильтр рынка": 1}
+    assert blocked.regime_off_hours == len(blocked.equity)
+    assert "Фильтр рынка запрещал входы 100%" in format_result(blocked)
+
+    with pytest.raises(ValueError, match="BTC"):
+        run_backtest({"SOL/USDT": frame}, cfg, start)

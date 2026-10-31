@@ -22,7 +22,16 @@ from .notifier import Notifier
 from .reports import EXIT_REASONS, daily_report_text, status_text
 from .risk import AccountState, RiskLimits, RiskManager
 from .storage import Position, Storage, from_iso, to_iso, utcnow
-from .strategy import EntrySignal, Features, StrategyParams, compute_features, entry_signal, evaluate_exit, timeframe_minutes
+from .strategy import (
+    EntrySignal,
+    Features,
+    StrategyParams,
+    compute_features,
+    entry_signal,
+    evaluate_exit,
+    regime_ok,
+    timeframe_minutes,
+)
 
 log = logging.getLogger(__name__)
 
@@ -38,6 +47,7 @@ class CycleSummary:
     llm_status: str = ""
     llm_report: str = ""
     llm_cost: float = 0.0
+    regime: str = ""  # состояние фильтра рынка, пусто если фильтр выключен
 
 
 class TradingEngine:
@@ -366,6 +376,19 @@ class TradingEngine:
         self._enforce_limits(self.account_state())
         return closed
 
+    def market_regime(self) -> tuple[bool, str]:
+        """(можно ли открывать сделки, пояснение). При ошибке данных входы запрещены."""
+        sym, period = self.s.regime_symbol, self.s.regime_ema
+        try:
+            daily = self.data.ohlcv(sym, "1d", max(400, period * 2))
+        except Exception as exc:  # noqa: BLE001
+            log.warning("фильтр рынка: дневные свечи %s недоступны: %s", sym, exc)
+            return False, f"нет данных {sym}, входы запрещены"
+        base = sym.split("/")[0]
+        if regime_ok(daily, period):
+            return True, f"{base} выше дневной EMA{period}"
+        return False, f"{base} ниже дневной EMA{period}, новых входов нет"
+
     def _collect_features(self, symbols: list[str]) -> dict[str, Features]:
         features: dict[str, Features] = {}
         for symbol in symbols:
@@ -465,6 +488,13 @@ class TradingEngine:
             if sig is not None:
                 signals.append(sig)
         summary.signals = [f"{s.symbol} ({s.id})" for s in signals]
+
+        # 3a. фильтр рынка: на падающем рынке новых входов нет (LLM это не обходит)
+        if self.s.regime_filter:
+            allowed_by_regime, summary.regime = self.market_regime()
+            if not allowed_by_regime and signals:
+                summary.rejected.extend(f"{s.symbol}: фильтр рынка ({summary.regime})" for s in signals)
+                signals = []
         log.info("universe=%d, свечи получены для %d, сигналов %d", len(universe), len(candidates), len(signals))
 
         # 4. LLM
