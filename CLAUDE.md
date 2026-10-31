@@ -14,7 +14,7 @@ Binance spot бот: стратегия трендового пробоя (`trad
   `TRADING_MODE=paper MARKET_DATA_URL=https://data-api.binance.vision python -m trader once`
   (домен `data-api.binance.vision` должен быть в Allowed domains среды; если он тоже отвечает 451, тестировать можно только офлайн).
 - Исходящий HTTPS идёт через прокси среды со своим CA (`REQUESTS_CA_BUNDLE`). ccxt читает окружение благодаря `requests_trust_env` в `make_binance`; не убирать, иначе будет `CERTIFICATE_VERIFY_FAILED`. Отключать проверку TLS нельзя.
-- Ключи (`BINANCE_TESTNET_API_KEY`, `BINANCE_TESTNET_API_SECRET`, `ANTHROPIC_API_KEY`, `TELEGRAM_*`) задаются переменными окружения среды; не просить их в чате и не выводить в лог.
+- Ключи (`BINANCE_TESTNET_API_KEY`, `BINANCE_TESTNET_API_SECRET`, `TRADER_ANTHROPIC_API_KEY`, `TELEGRAM_*`) задаются переменными окружения среды; не просить их в чате и не выводить в лог. `ANTHROPIC_API_KEY` среда в сессию не передаёт (он для самого Claude Code), поэтому бот читает запасное имя `TRADER_ANTHROPIC_API_KEY`.
 - Постоянная работа бота: компьютер пользователя или VPS в разрешённой стране (не США).
 
 ## Правила проекта
