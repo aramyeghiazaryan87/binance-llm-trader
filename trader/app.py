@@ -54,13 +54,27 @@ def build_broker(settings: Settings, storage: Storage, data: MarketData) -> Brok
     return CcxtBroker(exchange, settings.mode, settings.quote_asset)
 
 
+def anthropic_api_key() -> str | None:
+    """Ключ Anthropic API для бота.
+
+    TRADER_ANTHROPIC_API_KEY — запасное имя: облачная среда Claude Code не передаёт
+    ANTHROPIC_API_KEY в сессию (он зарезервирован под авторизацию самого Claude Code).
+    """
+    return os.getenv("ANTHROPIC_API_KEY") or os.getenv("TRADER_ANTHROPIC_API_KEY") or None
+
+
 def build_advisor(settings: Settings, storage: Storage) -> LLMAdvisor | None:
     if not settings.llm_enabled:
         return None
-    if not os.getenv("ANTHROPIC_API_KEY") and not os.getenv("ANTHROPIC_AUTH_TOKEN"):
-        log.warning("ANTHROPIC_API_KEY не задан: LLM отключён, действует LLM_FAIL_MODE=%s", settings.llm_fail_mode)
+    api_key = anthropic_api_key()
+    if not api_key and not os.getenv("ANTHROPIC_AUTH_TOKEN"):
+        log.warning(
+            "ANTHROPIC_API_KEY (или TRADER_ANTHROPIC_API_KEY) не задан: LLM отключён, действует LLM_FAIL_MODE=%s",
+            settings.llm_fail_mode,
+        )
         return None
     return LLMAdvisor(
+        api_key=api_key,
         storage=storage,
         budget=BudgetGuard(storage, settings.llm_monthly_budget_usd),
         model=settings.llm_model,

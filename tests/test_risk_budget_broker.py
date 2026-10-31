@@ -150,3 +150,11 @@ def test_public_market_data_url_override():
     assert data.urls["api"]["public"] == "https://data-api.binance.vision/api/v3"
     assert data.urls["api"]["private"] == "https://api.binance.com/api/v3"  # ордера не трогаем
     assert plain.urls["api"]["public"] == "https://api.binance.com/api/v3"  # другие клиенты не затронуты
+
+
+def test_exchange_honors_proxy_env_and_keeps_tls_verification():
+    from trader.market_data import make_binance
+
+    exchange = make_binance(public_url="https://data-api.binance.vision")
+    assert exchange.session.trust_env is True  # HTTPS_PROXY / REQUESTS_CA_BUNDLE из окружения
+    assert exchange.verify is True and exchange.validateServerSsl is True
