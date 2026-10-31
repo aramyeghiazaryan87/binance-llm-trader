@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 import os
+from collections.abc import Iterable
 from logging.handlers import RotatingFileHandler
 
 from .broker import Broker, CcxtBroker, PaperBroker
@@ -12,23 +13,66 @@ from .engine import TradingEngine
 from .llm import LLMAdvisor
 from .market_data import MarketData, make_binance
 from .news import NewsProvider
-from .notifier import Notifier
+from .notifier import TELEGRAM_TOKEN_RE, Notifier
 from .storage import Storage
 
 log = logging.getLogger(__name__)
 
 
+class SecretRedactor(logging.Filter):
+    """Прячет ключи и токены в записях лога, в том числе в тексте исключений.
+
+    Последняя линия защиты: ключи не должны попадать в лог, даже если их принесёт
+    сообщение об ошибке сторонней библиотеки (например, адрес запроса к Telegram).
+    """
+
+    def __init__(self, secrets: Iterable[str | None]):
+        super().__init__()
+        # короткие строки не трогаем, чтобы не портить обычный текст
+        self.secrets = sorted({s for s in secrets if s and len(s) >= 8}, key=len, reverse=True)
+
+    def redact(self, text: str) -> str:
+        for secret in self.secrets:
+            text = text.replace(secret, "<скрыто>")
+        return TELEGRAM_TOKEN_RE.sub("bot<скрыто>", text)
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            message = record.getMessage()
+            clean = self.redact(message)
+            if clean != message:
+                record.msg, record.args = clean, None
+            if record.exc_info and not record.exc_text:
+                record.exc_text = logging.Formatter().formatException(record.exc_info)
+            if record.exc_text:
+                record.exc_text = self.redact(record.exc_text)
+        except Exception:  # noqa: BLE001 — фильтр не должен ронять логирование
+            pass
+        return True
+
+
 def setup_logging(settings: Settings) -> None:
     settings.data_dir.mkdir(parents=True, exist_ok=True)
     fmt = logging.Formatter("%(asctime)s %(levelname)-7s %(name)s: %(message)s")
+    redactor = SecretRedactor(
+        [
+            settings.binance_api_key,
+            settings.binance_api_secret,
+            settings.telegram_bot_token,
+            anthropic_api_key(),
+            os.getenv("ANTHROPIC_AUTH_TOKEN"),
+        ]
+    )
     root = logging.getLogger()
     root.setLevel(settings.log_level)
     root.handlers.clear()
     console = logging.StreamHandler()
     console.setFormatter(fmt)
+    console.addFilter(redactor)
     root.addHandler(console)
     file_handler = RotatingFileHandler(settings.log_path, maxBytes=5_000_000, backupCount=3, encoding="utf-8")
     file_handler.setFormatter(fmt)
+    file_handler.addFilter(redactor)
     root.addHandler(file_handler)
     for noisy in ("urllib3", "httpx", "httpx2", "anthropic", "ccxt"):
         logging.getLogger(noisy).setLevel(logging.WARNING)

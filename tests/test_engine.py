@@ -1,4 +1,5 @@
 """Полный цикл бота офлайн: фейковая биржа + paper-исполнение + фейковый Claude."""
+import logging
 from dataclasses import replace
 
 import pytest
@@ -164,7 +165,8 @@ def regime_exchange(btc_drift: float):
     )
 
 
-def test_regime_filter_blocks_entries_even_if_llm_approves(settings, now):
+def test_regime_filter_blocks_entries_even_if_llm_approves(settings, now, caplog):
+    caplog.set_level(logging.INFO, logger="trader.engine")
     settings = replace(settings, regime_filter=True, regime_ema=50)
     engine, _, _, _, client = build(settings, now, responder=approving_responder(), exchange=regime_exchange(-0.002))
     engine.startup()
@@ -173,6 +175,7 @@ def test_regime_filter_blocks_entries_even_if_llm_approves(settings, now):
     assert [s.split(" ")[0] for s in summary.signals] == ["SOL/USDT"]
     assert summary.opened == [] and engine.storage.open_positions() == []
     assert "BTC ниже дневной EMA50" in summary.regime
+    assert "фильтр рынка: BTC ниже дневной EMA50" in caplog.text  # видно и в логе постоянного режима
     assert any(r.startswith("SOL/USDT: фильтр рынка") for r in summary.rejected)
     # Claude не тратит токены на сигнал, который всё равно запрещён
     assert SIGNAL_RE.findall(client.calls[0]["messages"][0]["content"]) == []

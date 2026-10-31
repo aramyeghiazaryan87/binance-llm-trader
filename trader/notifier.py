@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import time
 
 import requests
@@ -9,6 +10,8 @@ import requests
 log = logging.getLogger(__name__)
 
 TELEGRAM_LIMIT = 4000
+# токен в адресе запроса: https://api.telegram.org/bot<id>:<секрет>/sendMessage
+TELEGRAM_TOKEN_RE = re.compile(r"bot\d{5,}:[A-Za-z0-9_-]{20,}")
 
 
 class Notifier:
@@ -41,8 +44,14 @@ class Notifier:
                     log.warning("Telegram ответил %s: %s", response.status_code, response.text[:200])
             except requests.RequestException as exc:
                 ok = False
-                log.warning("Telegram недоступен: %s", exc)
+                # текст ошибки requests содержит адрес запроса, а в нём токен бота
+                log.warning("Telegram недоступен: %s", self.redact(str(exc)))
         return ok
+
+    def redact(self, text: str) -> str:
+        if self.token:
+            text = text.replace(self.token, "<скрыто>")
+        return TELEGRAM_TOKEN_RE.sub("bot<скрыто>", text)
 
     def error(self, text: str, min_interval_seconds: float = 1800.0) -> None:
         """Ошибки отправляем не чаще раза в 30 минут, чтобы не спамить."""

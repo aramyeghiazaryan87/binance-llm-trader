@@ -492,6 +492,7 @@ class TradingEngine:
         # 3a. фильтр рынка: на падающем рынке новых входов нет (LLM это не обходит)
         if self.s.regime_filter:
             allowed_by_regime, summary.regime = self.market_regime()
+            log.info("фильтр рынка: %s", summary.regime)
             if not allowed_by_regime and signals:
                 summary.rejected.extend(f"{s.symbol}: фильтр рынка ({summary.regime})" for s in signals)
                 signals = []
