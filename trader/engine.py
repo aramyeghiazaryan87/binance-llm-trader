@@ -15,7 +15,7 @@ from typing import Any, Callable
 
 from .broker import Broker, BrokerError
 from .config import Settings
-from .llm import DecisionContext, LLMAdvisor, LLMResult, PositionView
+from .llm import DecisionContext, LLMAdvisor, LLMResult, PositionView, SignalVerdict
 from .market_data import MarketData
 from .news import NewsProvider
 from .notifier import Notifier
@@ -380,6 +380,22 @@ class TradingEngine:
         self._enforce_limits(self.account_state())
         return closed
 
+    def _prior_verdicts(self, signal_ids: set[str]) -> dict[str, SignalVerdict]:
+        """Последние решения Claude по этим сигналам из журнала. id сигнала содержит время свечи,
+        поэтому найденное решение относится к тем же данным, а не к прошлому часу."""
+        found: dict[str, SignalVerdict] = {}
+        for decision in self.storage.decisions(kind="llm", limit=24):
+            for raw in decision["payload"].get("verdicts") or []:
+                sid = raw.get("signal_id")
+                if sid in signal_ids and sid not in found:
+                    try:
+                        found[sid] = SignalVerdict.model_validate(raw)
+                    except ValueError:
+                        continue
+        if found:
+            log.info("Claude уже оценивал %s: беру его прошлое решение", ", ".join(sorted(found)))
+        return found
+
     # ------------------------------------------------------------------ тень
     def _shadow(self, sig: EntrySignal, source: str, reason: str, confidence: float | None = None) -> None:
         """Запомнить отклонённый сигнал, чтобы потом посчитать, чем закончилась бы сделка."""
@@ -604,21 +620,26 @@ class TradingEngine:
         approved: list[tuple[EntrySignal, float | None, float, str]] = []
         if result.ok:
             verdicts = {v.signal_id: v for v in result.assessment.signal_verdicts}
-            for sig in signals:
-                v = verdicts.get(sig.id)
+        else:
+            # Claude в этом цикле не спрашивали (перезапуск в том же часе, сбой API, бюджет).
+            # Если он уже оценивал этот же сигнал (та же свеча), его решение в силе.
+            verdicts = self._prior_verdicts({sig.id for sig in signals}) if signals else {}
+        earlier = "" if result.ok else ", решение Claude из прошлого вызова"
+        for sig in signals:
+            v = verdicts.get(sig.id)
+            if result.ok or v is not None:
                 if v and v.approve and v.confidence >= self.s.min_llm_confidence:
-                    approved.append((sig, v.confidence, v.size_factor, v.reason))
+                    approved.append((sig, v.confidence, v.size_factor, v.reason + earlier))
                 else:
                     why = v.reason if v else "нет оценки"
                     if v and v.approve:
                         why = f"уверенность {v.confidence:.0%} ниже порога {self.s.min_llm_confidence:.0%}"
-                    summary.rejected.append(f"{sig.symbol}: LLM отклонил ({why})")
+                    summary.rejected.append(f"{sig.symbol}: LLM отклонил ({why}{earlier})")
                     self._shadow(sig, "llm", why, v.confidence if v else None)
-        elif signals and self.s.llm_fail_mode == "rules":
-            approved = [(sig, None, 0.5, "LLM недоступен, вход по правилам с половинным размером") for sig in signals]
-        else:
-            summary.rejected.extend(f"{sig.symbol}: LLM недоступен ({result.status}), режим hold" for sig in signals)
-            for sig in signals:
+            elif self.s.llm_fail_mode == "rules":
+                approved.append((sig, None, 0.5, "LLM недоступен, вход по правилам с половинным размером"))
+            else:
+                summary.rejected.append(f"{sig.symbol}: LLM недоступен ({result.status}), режим hold")
                 self._shadow(sig, "hold", f"LLM недоступен ({result.status})")
 
         approved.sort(key=lambda item: item[1] or 0.0, reverse=True)

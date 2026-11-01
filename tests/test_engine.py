@@ -1,6 +1,7 @@
 """Полный цикл бота офлайн: фейковая биржа + paper-исполнение + фейковый Claude."""
 import logging
 from dataclasses import replace
+from datetime import timedelta
 
 import pytest
 
@@ -277,3 +278,54 @@ def test_shadow_list_text(settings, now):
     engine.run_hourly_cycle()
     text = shadow_list_text(engine.storage, now)
     assert "SOL/USDT, отклонил Claude" in text and "ещё не закрыта" in text and "уверенность Claude 70%" in text
+
+
+def remember_verdict(engine, now, **verdict):
+    """Как будто Claude оценил текущий сигнал по SOL 10 минут назад, а потом бот перезапустили."""
+    from trader.strategy import entry_signal
+
+    sig = entry_signal(engine._collect_features(["SOL/USDT"])["SOL/USDT"], engine.params)
+    earlier = now - timedelta(minutes=10)
+    engine.storage.add_llm_call(time=earlier, model="claude-sonnet-5-5", status="ok", input_tokens=3700,
+                                output_tokens=300, cost_usd=0.01, detail="neutral")
+    engine.storage.add_decision(earlier, "llm", {"regime": "neutral", "verdicts": [{"signal_id": sig.id, **verdict}]})
+    return sig
+
+
+def test_restart_in_same_hour_reuses_claude_approval(settings, now):
+    engine, _, _, notifier, client = build(settings, now, responder=approving_responder())
+    engine.startup()
+    remember_verdict(engine, now, approve=True, confidence=0.8, size_factor=0.5, reason="clean breakout")
+
+    summary = engine.run_hourly_cycle()
+    assert summary.llm_status == "skipped" and client.calls == []  # Claude повторно не спрашивали
+    assert summary.opened == ["SOL/USDT"]
+    [pos] = engine.storage.open_positions()
+    assert pos.cost_usdt == pytest.approx(2000 * 0.5) and pos.llm_confidence == 0.8
+    assert any("решение Claude из прошлого вызова" in m for m in notifier.messages)
+
+
+def test_restart_in_same_hour_reuses_claude_rejection(settings, now):
+    engine, _, _, _, client = build(settings, now, responder=approving_responder())
+    engine.startup()
+    remember_verdict(engine, now, approve=False, confidence=0.7, size_factor=0.25, reason="RSI 71 extended")
+
+    summary = engine.run_hourly_cycle()
+    assert client.calls == [] and summary.opened == []
+    assert summary.rejected == ["SOL/USDT: LLM отклонил (RSI 71 extended, решение Claude из прошлого вызова)"]
+    [shadow] = engine.storage.shadows()
+    assert (shadow.source, shadow.confidence, shadow.reason) == ("llm", 0.7, "RSI 71 extended")
+
+
+def test_verdict_for_another_candle_is_not_reused(settings, now):
+    engine, *_ = build(settings, now, responder=approving_responder())
+    engine.startup()
+    sig = remember_verdict(engine, now, approve=True, confidence=0.9, size_factor=1.0, reason="old")
+    # то же решение, но для прошлой свечи: подменяем id в журнале
+    engine.storage.conn.execute("UPDATE decisions SET payload = replace(payload, ?, ?)", (sig.id, "SOLUSDT-202001010000"))
+    engine.storage.conn.commit()
+
+    summary = engine.run_hourly_cycle()
+    assert summary.opened == []
+    assert summary.rejected == ["SOL/USDT: LLM недоступен (skipped), режим hold"]
+    assert engine.storage.shadows()[0].source == "hold"
