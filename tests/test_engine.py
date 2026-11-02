@@ -329,3 +329,22 @@ def test_verdict_for_another_candle_is_not_reused(settings, now):
     assert summary.opened == []
     assert summary.rejected == ["SOL/USDT: LLM недоступен (skipped), режим hold"]
     assert engine.storage.shadows()[0].source == "hold"
+
+
+def test_each_rejected_signal_is_tracked_separately(settings, now):
+    """31.10–01.11 Claude трижды отклонил UNI; учёт видел только первый сигнал, пока его тень была открыта."""
+    engine, *_ = build(settings, now, responder=rejecting_responder())
+    engine.startup()
+    engine.run_hourly_cycle()
+    [first] = engine.storage.shadows(status="open")
+
+    from trader.strategy import entry_signal
+
+    current = entry_signal(engine._collect_features(["SOL/USDT"])["SOL/USDT"], engine.params)
+    later = replace(current, id="SOLUSDT-209901010000", price=current.price * 1.01)
+    engine._shadow(later, "llm", "RSI 73 extended", 0.6)
+    engine._shadow(later, "llm", "повтор того же сигнала", 0.6)
+
+    shadows = engine.storage.shadows(status="open")
+    assert [s.signal_id for s in shadows] == [first.signal_id, "SOLUSDT-209901010000"]
+    assert shadows[1].entry_price == pytest.approx(current.price * 1.01)
