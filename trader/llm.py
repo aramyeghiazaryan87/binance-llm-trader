@@ -33,7 +33,7 @@ Your tasks:
 1. market_regime: classify the overall crypto market right now as risk_on, neutral or risk_off.
 2. news_sentiment and news_summary: score the headline flow from -1 (very bearish) to 1 (very bullish) and say in one sentence what matters for trading.
 3. watchlist: pick up to {max_watchlist} symbols from the candidate table that look best for long trades over the next hours (healthy uptrend, liquidity, sane volatility, no negative coin-specific news). Use only symbols from the table. An empty list is allowed.
-4. signal_verdicts: exactly one verdict for every entry signal listed, using its id. approve=true only if the symbol is in your watchlist and the trade still makes sense given the regime, the news and how extended the move already is. confidence is from 0 to 1. size_factor from 0.25 to 1 scales the normal position size down when you are less sure. Approving nothing is a valid outcome.
+4. signal_verdicts: exactly one verdict for every entry signal listed, using its id. approve=true only if the symbol is in your watchlist and the trade still makes sense given the regime, the news and how extended the move already is. confidence is from 0 to 1: how likely you think the trade works out. The bot executes an approval only if confidence >= {min_confidence:.2f}; a lower-confidence approval is discarded, so do not approve with less. Express caution about an approved trade through size_factor (0.25 to 1 scales the normal position size down), not by lowering confidence. Approving nothing is a valid outcome.
 5. position_advice: exactly one item for every open position: hold or close. Advise close only for a concrete reason (trend clearly broken, clearly negative coin-specific news, market turned risk_off). Stop-losses and trailing stops are already enforced by code, so do not close just because of normal noise.
 6. report: 2-3 short sentences in Russian for the account owner: the market picture and what you decided.
 
@@ -301,12 +301,14 @@ class LLMAdvisor:
         client: Any | None = None,
         api_key: str | None = None,
         effort_signals: str | None = None,
+        min_confidence: float = 0.5,
     ):
         self.storage = storage
         self.budget = budget
         self.model = model
         self.effort = effort
         self.effort_signals = effort_signals or effort
+        self.min_confidence = min_confidence
         self.max_tokens = max_tokens
         self.max_watchlist = max_watchlist
         self.use_fallbacks = use_fallbacks
@@ -317,7 +319,7 @@ class LLMAdvisor:
 
     @property
     def system_prompt(self) -> str:
-        return SYSTEM_PROMPT.format(max_watchlist=self.max_watchlist)
+        return SYSTEM_PROMPT.format(max_watchlist=self.max_watchlist, min_confidence=self.min_confidence)
 
     def _record(self, now: datetime, result: LLMResult) -> LLMResult:
         self.storage.add_llm_call(

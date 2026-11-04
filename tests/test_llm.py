@@ -174,3 +174,21 @@ def test_effort_signals_setting_is_validated(monkeypatch, tmp_path):
     monkeypatch.setenv("LLM_EFFORT_SIGNALS", "turbo")
     with pytest.raises(ConfigError, match="LLM_EFFORT_SIGNALS"):
         Settings.from_env(None)
+
+
+def test_prompt_states_confidence_threshold(now):
+    storage = Storage(":memory:")
+    client = FakeClaude(approving_responder())
+    advisor = LLMAdvisor(storage=storage, budget=BudgetGuard(storage, 10.0), model="claude-sonnet-5-5", effort="low",
+                         max_tokens=4000, max_watchlist=5, client=client, min_confidence=0.5)
+    ctx, _ = make_ctx(now)
+    advisor.decide(ctx)
+    system = client.calls[-1]["system"]
+    assert "confidence >= 0.50" in system and "through size_factor" in system
+    assert "{" not in system  # все подстановки сделаны
+
+
+def test_default_confidence_threshold_is_half():
+    from trader.config import Settings
+
+    assert Settings().min_llm_confidence == 0.5
