@@ -116,7 +116,7 @@ class Settings:
     llm_min_minutes_between_calls: float = 50.0
     llm_fallbacks: bool = True
     llm_fail_mode: str = "hold"  # hold | rules
-    min_llm_confidence: float = 0.6
+    min_llm_confidence: float = 0.5
     close_advice_min_confidence: float = 0.7
 
     # --- новости ---
@@ -197,7 +197,7 @@ class Settings:
             llm_min_minutes_between_calls=_float("LLM_MIN_MINUTES_BETWEEN_CALLS", 50.0),
             llm_fallbacks=_bool("LLM_FALLBACKS", True),
             llm_fail_mode=_str("LLM_FAIL_MODE", "hold").lower(),
-            min_llm_confidence=_float("MIN_LLM_CONFIDENCE", 0.6),
+            min_llm_confidence=_float("MIN_LLM_CONFIDENCE", 0.5),
             close_advice_min_confidence=_float("CLOSE_ADVICE_MIN_CONFIDENCE", 0.7),
             news_enabled=_bool("NEWS_ENABLED", True),
             news_feeds=_list("NEWS_FEEDS", DEFAULT_NEWS_FEEDS),

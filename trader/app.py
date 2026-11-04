@@ -126,6 +126,7 @@ def build_advisor(settings: Settings, storage: Storage) -> LLMAdvisor | None:
         effort_signals=settings.llm_effort_signals,
         max_tokens=settings.llm_max_tokens,
         max_watchlist=settings.max_watchlist,
+        min_confidence=settings.min_llm_confidence,
         use_fallbacks=settings.llm_fallbacks,
     )
 
