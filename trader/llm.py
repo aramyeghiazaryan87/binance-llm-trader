@@ -27,7 +27,7 @@ FALLBACK_BETA = "server-side-fallback-2026-07-01"
 
 SYSTEM_PROMPT = """You are the decision layer of an automated Binance SPOT trading bot. It is long-only: it can only buy coins with USDT and sell them back; no leverage, no shorting.
 
-Once per hour you receive the account state, open positions, a table of candidate USDT pairs with indicators from closed 1h candles, entry signals produced by {strategy_description}, recent news headlines and the Crypto Fear & Greed index.
+After every closed {timeframe} candle you receive the account state, open positions, a table of candidate USDT pairs with indicators from closed {timeframe} candles, entry signals produced by {strategy_description}, recent news headlines and the Crypto Fear & Greed index.
 
 Your tasks:
 1. market_regime: classify the overall crypto market right now as risk_on, neutral or risk_off.
@@ -157,7 +157,7 @@ def build_user_prompt(ctx: DecisionContext) -> str:
             else "fear_greed_index: unavailable"
         ),
         "",
-        "candidates (closed 1h candles; chg in %; atr% = ATR14/price; vol_x = last candle volume / 20-candle average; "
+        "candidates (closed candles of the timeframe given in the instructions; chg in %; atr% = ATR14/price; vol_x = last candle volume / 20-candle average; "
         "trend up = EMA20>EMA50>EMA200, down = the reverse; to_20h_high% = price vs the prior 20-candle high):",
         "symbol,price,chg24h,chg7d,rsi14,atr%,vol_x,trend,to_20h_high%",
     ]
@@ -303,6 +303,7 @@ class LLMAdvisor:
         effort_signals: str | None = None,
         min_confidence: float = 0.5,
         strategy: str = "breakout",
+        timeframe: str = "1h",
     ):
         self.storage = storage
         self.budget = budget
@@ -311,6 +312,7 @@ class LLMAdvisor:
         self.effort_signals = effort_signals or effort
         self.min_confidence = min_confidence
         self.strategy = strategy
+        self.timeframe = timeframe
         self.max_tokens = max_tokens
         self.max_watchlist = max_watchlist
         self.use_fallbacks = use_fallbacks
@@ -325,6 +327,7 @@ class LLMAdvisor:
             max_watchlist=self.max_watchlist,
             min_confidence=self.min_confidence,
             strategy_description=STRATEGY_DESCRIPTIONS[self.strategy],
+            timeframe=self.timeframe,
         )
 
     def _record(self, now: datetime, result: LLMResult) -> LLMResult:

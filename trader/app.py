@@ -128,6 +128,7 @@ def build_advisor(settings: Settings, storage: Storage) -> LLMAdvisor | None:
         max_watchlist=settings.max_watchlist,
         min_confidence=settings.min_llm_confidence,
         strategy=settings.strategy,
+        timeframe=settings.timeframe,
         use_fallbacks=settings.llm_fallbacks,
     )
 

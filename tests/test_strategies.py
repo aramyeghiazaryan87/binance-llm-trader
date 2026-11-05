@@ -108,3 +108,14 @@ def test_backtest_runs_pullback_strategy():
     assert pullback.signals == 1 and len(pullback.trades) == 1
     assert pullback.trades[0].entry_time == signal_time + timedelta(hours=1)
     assert BacktestConfig().with_overrides({"STRATEGY": "pullback"}).strategy == "pullback"
+
+
+def test_prompt_states_real_timeframe(settings, now):
+    from .conftest import approving_responder
+    from .test_engine import build
+
+    engine, *_ = build(settings, now, responder=approving_responder())
+    assert "closed 1h candles" in engine.advisor.system_prompt
+    engine.advisor.timeframe = "4h"
+    prompt = engine.advisor.system_prompt
+    assert "After every closed 4h candle" in prompt and "1h" not in prompt
