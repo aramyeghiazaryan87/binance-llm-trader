@@ -127,6 +127,7 @@ def build_advisor(settings: Settings, storage: Storage) -> LLMAdvisor | None:
         max_tokens=settings.llm_max_tokens,
         max_watchlist=settings.max_watchlist,
         min_confidence=settings.min_llm_confidence,
+        strategy=settings.strategy,
         use_fallbacks=settings.llm_fallbacks,
     )
 
@@ -148,7 +149,7 @@ def build_engine(settings: Settings) -> TradingEngine:
         news_enabled=settings.news_enabled,
         fear_greed_enabled=settings.fear_greed_enabled,
     )
-    notifier = Notifier(settings.telegram_bot_token, settings.telegram_chat_id, prefix=f"[{settings.mode.upper()}]")
+    notifier = Notifier(settings.telegram_bot_token, settings.telegram_chat_id, prefix=f"[{settings.mode.upper()}{' ' + settings.bot_name if settings.bot_name else ''}]")
     return TradingEngine(
         settings=settings,
         storage=storage,

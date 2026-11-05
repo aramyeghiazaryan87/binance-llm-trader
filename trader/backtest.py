@@ -39,7 +39,8 @@ import pandas as pd
 from .indicators import rolling_high, sma
 from .market_data import ohlcv_to_frame, with_retries
 from .risk import AccountState, RiskLimits, RiskManager
-from .strategy import StrategyParams, compute_features, entry_signal, evaluate_exit, regime_series, timeframe_minutes
+from .indicators import rsi as rsi_series
+from .strategy import STRATEGIES, StrategyParams, compute_features, evaluate_exit, regime_series, timeframe_minutes
 
 log = logging.getLogger(__name__)
 
@@ -70,6 +71,7 @@ class BacktestConfig:
     # 0 = как у живого бота: после аварийной остановки сделок больше нет (снимается только вручную).
     # >0 = остановка снимается через столько часов, пик капитала сбрасывается (как reset-kill-switch).
     kill_switch_reset_hours: float = 0.0
+    strategy: str = "breakout"  # breakout | pullback
     regime_filter: bool = False  # входы только когда BTC выше дневной EMA(regime_ema), как REGIME_FILTER
     regime_ema: int = 200
 
@@ -81,6 +83,9 @@ class BacktestConfig:
                 min_volume_ratio=s.min_volume_ratio,
                 atr_stop_mult=s.atr_stop_mult,
                 atr_trail_mult=s.atr_trail_mult,
+                pullback_rsi_min=s.pullback_rsi_min,
+                pullback_rsi_max=s.pullback_rsi_max,
+                pullback_ema_atr=s.pullback_ema_atr,
             ),
             limits=RiskLimits(
                 risk_per_trade_pct=s.risk_per_trade_pct,
@@ -101,6 +106,7 @@ class BacktestConfig:
             timeframe=s.timeframe,
             min_quote_volume=s.min_quote_volume,
             regime_filter=s.regime_filter,
+            strategy=s.strategy,
             regime_ema=s.regime_ema,
         )
 
@@ -256,11 +262,16 @@ class BacktestResult:
         return counts
 
 
-def _prefilter(df: pd.DataFrame, params: StrategyParams) -> pd.Series:
+def _prefilter(df: pd.DataFrame, params: StrategyParams, strategy: str = "breakout") -> pd.Series:
     """Быстрый отсев: пробой и объём не зависят от длины окна, их можно посчитать сразу по всей истории.
 
     Полную проверку (EMA, RSI, ATR) делает entry_signal только там, где отсев пройден.
     """
+    if strategy == "pullback":
+        # отскок (зелёная свеча выше прошлого закрытия) и RSI около нужного диапазона; точно проверит pullback_signal
+        r = rsi_series(df["close"], params.rsi_period)
+        bounce = (df["close"] > df["open"]) & (df["close"] > df["close"].shift(1))
+        return bounce & (r >= params.pullback_rsi_min - 3) & (r <= params.pullback_rsi_max + 3)
     level = rolling_high(df["high"], params.breakout_lookback)
     vol_avg = sma(df["volume"].shift(1), params.volume_lookback)
     return (df["close"] > level) & (df["volume"] >= params.min_volume_ratio * vol_avg)
@@ -296,7 +307,8 @@ def run_backtest(
     result.end = times[-1] + tf
 
     positions_idx = {s: {ts: i for i, ts in enumerate(frames[s].index)} for s in symbols}
-    prefilter = {s: _prefilter(frames[s], params).to_numpy() for s in symbols}
+    signal_fn = STRATEGIES[cfg.strategy]
+    prefilter = {s: _prefilter(frames[s], params, cfg.strategy).to_numpy() for s in symbols}
     closes = {s: frames[s]["close"].to_numpy() for s in symbols}
     volume_rank = _volume_ranking(frames, symbols, times, cfg) if cfg.dynamic_universe else None
     regime_at = None
@@ -401,7 +413,7 @@ def run_backtest(
                 continue
             window = frames[symbol].iloc[i + 1 - cfg.candles_window : i + 1]
             features = compute_features(symbol, window, params, cfg.timeframe)
-            sig = entry_signal(features, params) if features else None
+            sig = signal_fn(features, params) if features else None
             if sig is None:
                 continue
             if symbol in open_trades:

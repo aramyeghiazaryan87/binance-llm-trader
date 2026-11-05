@@ -19,7 +19,7 @@ from .budget import BudgetGuard, estimate_input_tokens, usage_cost, worst_case_c
 from .news import FearGreed, Headline
 from .risk import AccountState
 from .storage import Position, Storage
-from .strategy import EntrySignal, Features
+from .strategy import STRATEGY_DESCRIPTIONS, EntrySignal, Features
 
 log = logging.getLogger(__name__)
 
@@ -27,7 +27,7 @@ FALLBACK_BETA = "server-side-fallback-2026-07-01"
 
 SYSTEM_PROMPT = """You are the decision layer of an automated Binance SPOT trading bot. It is long-only: it can only buy coins with USDT and sell them back; no leverage, no shorting.
 
-Once per hour you receive the account state, open positions, a table of candidate USDT pairs with indicators from closed 1h candles, entry signals produced by a rule-based trend-breakout strategy, recent news headlines and the Crypto Fear & Greed index.
+Once per hour you receive the account state, open positions, a table of candidate USDT pairs with indicators from closed 1h candles, entry signals produced by {strategy_description}, recent news headlines and the Crypto Fear & Greed index.
 
 Your tasks:
 1. market_regime: classify the overall crypto market right now as risk_on, neutral or risk_off.
@@ -168,7 +168,7 @@ def build_user_prompt(ctx: DecisionContext) -> str:
         )
     lines.append("")
     if ctx.signals:
-        lines.append("entry_signals (trend breakout; the stop is placed by code):")
+        lines.append("entry_signals (from the strategy described in the instructions; the stop is placed by code):")
         for s in ctx.signals:
             lines.append(
                 f"- id={s.id} symbol={s.symbol} price={_fmt(s.price)} stop={_fmt(s.stop_price)} (-{s.stop_pct:.1f}%) "
@@ -302,6 +302,7 @@ class LLMAdvisor:
         api_key: str | None = None,
         effort_signals: str | None = None,
         min_confidence: float = 0.5,
+        strategy: str = "breakout",
     ):
         self.storage = storage
         self.budget = budget
@@ -309,6 +310,7 @@ class LLMAdvisor:
         self.effort = effort
         self.effort_signals = effort_signals or effort
         self.min_confidence = min_confidence
+        self.strategy = strategy
         self.max_tokens = max_tokens
         self.max_watchlist = max_watchlist
         self.use_fallbacks = use_fallbacks
@@ -319,7 +321,11 @@ class LLMAdvisor:
 
     @property
     def system_prompt(self) -> str:
-        return SYSTEM_PROMPT.format(max_watchlist=self.max_watchlist, min_confidence=self.min_confidence)
+        return SYSTEM_PROMPT.format(
+            max_watchlist=self.max_watchlist,
+            min_confidence=self.min_confidence,
+            strategy_description=STRATEGY_DESCRIPTIONS[self.strategy],
+        )
 
     def _record(self, now: datetime, result: LLMResult) -> LLMResult:
         self.storage.add_llm_call(

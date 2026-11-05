@@ -42,6 +42,10 @@ class StrategyParams:
     max_atr_pct: float = 6.0
     atr_stop_mult: float = 2.0
     atr_trail_mult: float = 3.0
+    # стратегия «откат в тренде» (pullback)
+    pullback_rsi_min: float = 35.0
+    pullback_rsi_max: float = 55.0
+    pullback_ema_atr: float = 1.0  # цена не дальше стольких ATR от EMA50
 
 
 @dataclass(frozen=True)
@@ -61,6 +65,8 @@ class Features:
     trend: str  # up | down | mixed
     breakout_level: float
     dist_to_breakout_pct: float
+    open_price: float = float("nan")  # открытие последней закрытой свечи
+    prev_close: float = float("nan")  # закрытие предыдущей свечи
 
 
 @dataclass(frozen=True)
@@ -146,6 +152,8 @@ def compute_features(symbol: str, df: pd.DataFrame, params: StrategyParams, time
         trend=trend,
         breakout_level=last_level,
         dist_to_breakout_pct=(price / last_level - 1.0) * 100.0 if last_level > 0 else 0.0,
+        open_price=float(df["open"].iloc[-1]),
+        prev_close=float(close.iloc[-2]),
     )
 
 
@@ -203,6 +211,50 @@ def entry_signal(f: Features, params: StrategyParams) -> EntrySignal | None:
         reason=reason,
         features=f,
     )
+
+
+def pullback_conditions(f: Features, params: StrategyParams) -> dict[str, bool]:
+    return {
+        "above_ema200": f.price > f.ema_slow,
+        "ema50_above_ema200": f.ema_mid > f.ema_slow,
+        "rsi_pullback": params.pullback_rsi_min <= f.rsi <= params.pullback_rsi_max,
+        "near_ema50": abs(f.price - f.ema_mid) <= params.pullback_ema_atr * f.atr,
+        "bounce": f.price > f.open_price and f.price > f.prev_close,
+        "atr_in_range": params.min_atr_pct <= f.atr_pct <= params.max_atr_pct,
+    }
+
+
+def pullback_signal(f: Features, params: StrategyParams) -> EntrySignal | None:
+    """Стратегия «Откат в тренде»: в устойчивом восходящем тренде (цена и EMA50 выше EMA200)
+    цена откатилась к EMA50 (RSI 35..55), и свеча закрылась отскоком вверх. Покупаем отскок."""
+    if not all(pullback_conditions(f, params).values()):
+        return None
+    stop = f.price - params.atr_stop_mult * f.atr
+    if stop <= 0:
+        return None
+    reason = (
+        f"откат к EMA50 {f.ema_mid:.6g} ({(f.price / f.ema_mid - 1) * 100:+.1f}%) и отскок, "
+        f"RSI {f.rsi:.0f}, ATR {f.atr_pct:.2f}%"
+    )
+    return EntrySignal(
+        id=f"{f.symbol.replace('/', '')}-{f.candle_time:%Y%m%d%H%M}",
+        symbol=f.symbol,
+        price=f.price,
+        atr=f.atr,
+        stop_price=stop,
+        stop_pct=(1.0 - stop / f.price) * 100.0,
+        reason=reason,
+        features=f,
+    )
+
+
+STRATEGIES = {"breakout": entry_signal, "pullback": pullback_signal}
+STRATEGY_DESCRIPTIONS = {
+    "breakout": "a rule-based trend-breakout strategy (buys when the close breaks above the 20-candle high on "
+                "rising volume in an uptrend)",
+    "pullback": "a rule-based pullback strategy (in an established uptrend it buys the first bounce after the price "
+                "dips back to the 50-period EMA)",
+}
 
 
 def evaluate_exit(

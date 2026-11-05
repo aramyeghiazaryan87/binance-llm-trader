@@ -101,6 +101,12 @@ class Settings:
     atr_trail_mult: float = 3.0
     breakout_lookback: int = 20
     min_volume_ratio: float = 1.2
+    strategy: str = "breakout"  # breakout (пробой) | pullback (откат в тренде)
+    pullback_rsi_min: float = 35.0
+    pullback_rsi_max: float = 55.0
+    pullback_ema_atr: float = 1.0
+    # имя бота: своя база, лог и метка в Telegram, чтобы два бота работали рядом
+    bot_name: str = ""
     # фильтр рынка: новые входы только когда REGIME_SYMBOL закрылся выше дневной EMA(REGIME_EMA)
     regime_filter: bool = True
     regime_symbol: str = "BTC/USDT"
@@ -185,6 +191,11 @@ class Settings:
             atr_trail_mult=_float("ATR_TRAIL_MULT", 3.0),
             breakout_lookback=_int("BREAKOUT_LOOKBACK", 20),
             min_volume_ratio=_float("MIN_VOLUME_RATIO", 1.2),
+            strategy=_str("STRATEGY", "breakout").lower(),
+            pullback_rsi_min=_float("PULLBACK_RSI_MIN", 35.0),
+            pullback_rsi_max=_float("PULLBACK_RSI_MAX", 55.0),
+            pullback_ema_atr=_float("PULLBACK_EMA_ATR", 1.0),
+            bot_name=_str("BOT_NAME", ""),
             regime_filter=_bool("REGIME_FILTER", True),
             regime_symbol=_str("REGIME_SYMBOL", "BTC/USDT").upper(),
             regime_ema=_int("REGIME_EMA", 200),
@@ -255,6 +266,10 @@ class Settings:
             p.append("MAX_TOTAL_EXPOSURE_PCT должен быть в диапазоне (0, 100]")
         if self.max_open_positions < 1:
             p.append("MAX_OPEN_POSITIONS должен быть >= 1")
+        if self.strategy not in ("breakout", "pullback"):
+            p.append("STRATEGY должен быть breakout или pullback")
+        if self.bot_name and not self.bot_name.replace("_", "").replace("-", "").isalnum():
+            p.append("BOT_NAME: только буквы, цифры, - и _")
         if self.regime_ema < 2:
             p.append("REGIME_EMA должен быть >= 2")
         if self.candles_limit < 230:
@@ -265,8 +280,12 @@ class Settings:
 
     @property
     def db_path(self) -> Path:
-        return self.data_dir / f"trader_{self.mode}.db"
+        return self.data_dir / f"trader_{self.mode}{self._suffix}.db"
 
     @property
     def log_path(self) -> Path:
-        return self.data_dir / f"trader_{self.mode}.log"
+        return self.data_dir / f"trader_{self.mode}{self._suffix}.log"
+
+    @property
+    def _suffix(self) -> str:
+        return f"_{self.bot_name}" if self.bot_name else ""

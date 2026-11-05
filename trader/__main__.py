@@ -25,7 +25,6 @@ from .app import build_engine, setup_logging
 from .budget import estimate_input_tokens, month_bounds, tokens_cost
 from .config import ConfigError, Settings
 from .llm import DecisionContext, PositionView, build_user_prompt
-from .strategy import entry_signal
 
 log = logging.getLogger("trader")
 
@@ -67,7 +66,7 @@ def cmd_check(engine) -> int:
     )
     print(f"  {len(universe)}: {', '.join(universe) or '—'}")
     features = engine._collect_features(universe)
-    signals = [sig for f in features.values() if (sig := entry_signal(f, engine.params))]
+    signals = [sig for f in features.values() if (sig := engine.signal_fn(f, engine.params))]
     print(f"  свечи получены: {len(features)}, сигналов на вход прямо сейчас: {len(signals)}")
     for sig in signals:
         print(f"   • {sig.symbol}: {sig.reason}")
