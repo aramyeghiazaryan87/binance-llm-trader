@@ -27,7 +27,7 @@ from .strategy import (
     Features,
     StrategyParams,
     compute_features,
-    entry_signal,
+    STRATEGIES,
     evaluate_exit,
     regime_ok,
     timeframe_minutes,
@@ -76,7 +76,11 @@ class TradingEngine:
             min_volume_ratio=settings.min_volume_ratio,
             atr_stop_mult=settings.atr_stop_mult,
             atr_trail_mult=settings.atr_trail_mult,
+            pullback_rsi_min=settings.pullback_rsi_min,
+            pullback_rsi_max=settings.pullback_rsi_max,
+            pullback_ema_atr=settings.pullback_ema_atr,
         )
+        self.signal_fn = STRATEGIES[settings.strategy]
         self.risk = RiskManager(
             RiskLimits(
                 risk_per_trade_pct=settings.risk_per_trade_pct,
@@ -563,7 +567,7 @@ class TradingEngine:
         for f in candidates:
             if f.symbol in held or f.symbol in cooldowns:
                 continue
-            sig = entry_signal(f, self.params)
+            sig = self.signal_fn(f, self.params)
             if sig is not None:
                 signals.append(sig)
         summary.signals = [f"{s.symbol} ({s.id})" for s in signals]
